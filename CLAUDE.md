@@ -10,8 +10,8 @@ into that context and **unmounted** to free the space, and workers that talk
 over an NNG message bus. The design lives in `ftw_plan.md`; read it before
 making architectural changes.
 
-**Status:** planning. No code yet. Don't write implementation code until the
-user says the planning stage is over.
+**Status:** implementation started. Phase 0 (protocol + bus + runtime dir) is
+done. See §8 of `ftw_plan.md` for the phase list and what's next.
 
 ## Non-negotiables
 
@@ -43,10 +43,20 @@ user says the planning stage is over.
 - Python 3.14 (system). `pynng` 0.9.0 ships a cp314 manylinux wheel.
 - **uv** manages the project (no pip/Poetry): `uv sync`, `uv run pytest`,
   `uv run ftw`. Add deps with `uv add`.
-- Planned deps: `pynng`, `pydantic`, `pyyaml`, `httpx`; dev: `pytest`.
+- Deps: `pynng`, `pydantic`, `pyyaml`, `httpx`; dev: `pytest`, `pytest-timeout`.
 - Providers: DeepSeek and Nous Research Portal, both via the OpenAI-compatible
   adapter (see §6 of the plan). Live-provider checks are opt-in smoke tests,
   never part of `pytest`.
+- Regenerate `schemas/*.schema.json` after touching `protocol.py`:
+  `uv run scripts/export_schemas.py`.
+
+## Testing
+
+`uv run pytest` (10s per-test timeout is configured; a hang is a bug, not
+something to wait out). All bus tests run over `inproc://`; ipc:// tests use
+the `isolated_runtime_dir` fixture so they never touch the real runtime dir.
+Every module lands with its test file written and shown failing *first* —
+don't skip the red step even when the implementation feels obvious.
 
 ## Layout
 

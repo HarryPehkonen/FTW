@@ -1,0 +1,33 @@
+[project]
+name = "ftw"
+version = "0.1.0"
+description = "Framed Task Workers: a local-first agent framework with an NNG message spine and a mount/unmount skill workbench."
+readme = "README.md"
+authors = [
+    { name = "Harri Pehkonen", email = "harry.pehkonen@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.13.5",
+    "pynng>=0.9.0",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+ftw = "ftw:main"
+
+[build-system]
+requires = ["uv_build>=0.12.18,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-timeout>=2.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 10
+addopts = "-ra --strict-markers"
