@@ -14,7 +14,9 @@ import sys
 from typing import Callable, TextIO
 
 from ftw.agent_loop import AgentLoop
+from ftw.frames import FrameError
 from ftw.protocol import CallEnvelope
+from ftw.skills.registry import SkillNotFound
 
 InputFn = Callable[[str], str]
 
@@ -84,8 +86,73 @@ class ReplSession:
             self.agent_loop.workbench.clear_turns()
             self._print("cleared turn horizon")
             return True
+        if cmd == "/mount":
+            return self._cmd_mount(parts)
+        if cmd == "/unmount":
+            return self._cmd_unmount(parts)
+        if cmd == "/focus":
+            return self._cmd_focus(parts)
+        if cmd == "/frames":
+            return self._cmd_frames()
 
         self._print(f"unknown command: {cmd}")
+        return True
+
+    # -- skill mounting commands (ftw_plan.md §3.2 Frames) -----------------
+
+    def _cmd_mount(self, parts: list[str]) -> bool:
+        if self.agent_loop.frame_tree is None:
+            self._print("no skill store configured")
+            return True
+        tokens = parts[1].split() if len(parts) > 1 else []
+        pinned = "--pin" in tokens
+        names = [t for t in tokens if t != "--pin"]
+        if not names:
+            self._print("usage: /mount [--pin] <skill>")
+            return True
+        try:
+            frame = self.agent_loop.frame_tree.mount(names[0], owner="user", pinned=pinned)
+        except (FrameError, SkillNotFound) as exc:
+            self._print(f"error: {exc}")
+            return True
+        self._print(f"mounted {frame.skill_name!r}" + (" (pinned)" if pinned else ""))
+        return True
+
+    def _cmd_unmount(self, parts: list[str]) -> bool:
+        if self.agent_loop.frame_tree is None:
+            self._print("no skill store configured")
+            return True
+        name = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            if name:
+                milestone = self.agent_loop.frame_tree.unmount(name, by="user")
+            else:
+                milestone = self.agent_loop.frame_tree.unmount_focused(by="user")
+        except FrameError as exc:
+            self._print(f"error: {exc}")
+            return True
+        self._print(f"unmounted; milestone: {milestone}")
+        return True
+
+    def _cmd_focus(self, parts: list[str]) -> bool:
+        if self.agent_loop.frame_tree is None:
+            self._print("no skill store configured")
+            return True
+        name = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            self.agent_loop.frame_tree.focus(name or None)
+        except FrameError as exc:
+            self._print(f"error: {exc}")
+            return True
+        focused = self.agent_loop.frame_tree.focused_skill_name
+        self._print(f"focus: {focused}" if focused else "focus: (root session)")
+        return True
+
+    def _cmd_frames(self) -> bool:
+        if self.agent_loop.frame_tree is None:
+            self._print("no skill store configured")
+            return True
+        self._print(self.agent_loop.frame_tree.render_tree())
         return True
 
     def _print(self, text: str) -> None:

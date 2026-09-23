@@ -51,6 +51,18 @@ def _turn_tokens(turn: list[ChatMessage]) -> int:
 
 
 @dataclass
+class _TurnRecord:
+    frame_id: str | None
+    messages: list[ChatMessage]
+
+
+@dataclass
+class _PinRecord:
+    frame_id: str | None
+    value: str
+
+
+@dataclass
 class ZoneSnapshot:
     name: str
     tokens: int
@@ -93,8 +105,8 @@ class ContextWorkbench:
 
         self._mounted_skill_text = ""
         self._milestones: list[str] = []
-        self._turns: list[list[ChatMessage]] = []
-        self._scratchpad: dict[str, str] = {}
+        self._turns: list[_TurnRecord] = []
+        self._scratchpad: dict[str, _PinRecord] = {}
         self._on_turn_evicted = on_turn_evicted
 
     # -- System Anchor / User Memory: static, set at construction ---------
@@ -117,6 +129,10 @@ class ContextWorkbench:
     def mounted_skill_tokens(self) -> int:
         return count_tokens(self._mounted_skill_text)
 
+    @property
+    def mounted_skill_budget(self) -> int:
+        return self._mounted_skill_budget
+
     # -- Milestones: rolling, oldest evicted first over budget ------------
 
     def add_milestone(self, text: str) -> None:
@@ -137,33 +153,53 @@ class ContextWorkbench:
         return self._milestones_tokens_of(self._milestones)
 
     # -- Turn Horizon: rolling FIFO, oldest turn evicted first ------------
+    #
+    # Every turn is tagged with the frame it belongs to (None = the base
+    # session, untagged). Budget-driven eviction below is oldest-first and
+    # frame-agnostic; evict_frame() is the other way a turn leaves the
+    # horizon — an explicit, frame-scoped removal on unmount (ftw_plan.md
+    # §3.2 "Eviction is by subtree").
 
-    def add_turn(self, messages: list[ChatMessage]) -> None:
-        self._turns.append(list(messages))
+    def add_turn(self, messages: list[ChatMessage], frame_id: str | None = None) -> None:
+        self._turns.append(_TurnRecord(frame_id, list(messages)))
         while self.turn_horizon_tokens > self._turn_horizon_budget and len(self._turns) > 1:
             evicted = self._turns.pop(0)
-            if self._on_turn_evicted is not None:
-                self._on_turn_evicted(evicted)
+            self._fire_turn_evicted(evicted.messages)
 
     def clear_turns(self) -> None:
         while self._turns:
             evicted = self._turns.pop(0)
-            if self._on_turn_evicted is not None:
-                self._on_turn_evicted(evicted)
+            self._fire_turn_evicted(evicted.messages)
+
+    def evict_frame(self, frame_id: str) -> list[list[ChatMessage]]:
+        """Removes every turn tagged with ``frame_id`` (order preserved) and
+        returns their messages — for the unmounting frame to summarize."""
+        keep, evicted = [], []
+        for record in self._turns:
+            (evicted if record.frame_id == frame_id else keep).append(record)
+        self._turns = keep
+        for record in evicted:
+            self._fire_turn_evicted(record.messages)
+        return [record.messages for record in evicted]
+
+    def _fire_turn_evicted(self, messages: list[ChatMessage]) -> None:
+        if self._on_turn_evicted is not None:
+            self._on_turn_evicted(messages)
 
     @property
     def turns(self) -> list[list[ChatMessage]]:
-        return [list(t) for t in self._turns]
+        return [list(record.messages) for record in self._turns]
 
     @property
     def turn_horizon_tokens(self) -> int:
-        return sum(_turn_tokens(t) for t in self._turns)
+        return sum(_turn_tokens(record.messages) for record in self._turns)
 
-    # -- Scratchpad: explicit pins, refused (not silently dropped) over budget
+    # -- Scratchpad: explicit pins, refused (not silently dropped) over budget.
+    #    Each pin is tagged with a frame the same way turns are.
 
-    def pin(self, key: str, value: str) -> None:
+    def pin(self, key: str, value: str, frame_id: str | None = None) -> None:
         candidate = dict(self._scratchpad)
-        candidate[key] = value
+        candidate[key] = _PinRecord(frame_id, value)
         if self._scratchpad_tokens_of(candidate) > self._scratchpad_budget:
             raise WorkbenchBudgetExceeded(
                 f"pinning {key!r} would exceed the scratchpad budget ({self._scratchpad_budget} tokens)"
@@ -173,13 +209,20 @@ class ContextWorkbench:
     def unpin(self, key: str) -> None:
         del self._scratchpad[key]  # raises KeyError for an unknown key, deliberately
 
+    def evict_frame_pins(self, frame_id: str) -> dict[str, str]:
+        """Removes and returns every pin tagged with ``frame_id``."""
+        evicted = {k: r.value for k, r in self._scratchpad.items() if r.frame_id == frame_id}
+        for key in evicted:
+            del self._scratchpad[key]
+        return evicted
+
     @staticmethod
-    def _scratchpad_tokens_of(scratchpad: dict[str, str]) -> int:
-        return count_tokens("\n".join(f"{k}={v}" for k, v in scratchpad.items()))
+    def _scratchpad_tokens_of(scratchpad: dict[str, "_PinRecord"]) -> int:
+        return count_tokens("\n".join(f"{k}={r.value}" for k, r in scratchpad.items()))
 
     @property
     def scratchpad(self) -> dict[str, str]:
-        return dict(self._scratchpad)
+        return {k: r.value for k, r in self._scratchpad.items()}
 
     @property
     def scratchpad_tokens(self) -> int:
@@ -204,11 +247,11 @@ class ContextWorkbench:
         messages: list[ChatMessage] = []
         if system_content:
             messages.append(ChatMessage(role=ChatRole.SYSTEM, content=system_content))
-        for turn in self._turns:
-            messages.extend(turn)
+        for record in self._turns:
+            messages.extend(record.messages)
         messages.extend(extra_messages or [])
         if self._scratchpad:
-            scratchpad_text = "\n".join(f"{k}={v}" for k, v in self._scratchpad.items())
+            scratchpad_text = "\n".join(f"{k}={r.value}" for k, r in self._scratchpad.items())
             messages.append(ChatMessage(role=ChatRole.SYSTEM, content=scratchpad_text))
         return messages
 
@@ -234,7 +277,7 @@ class ContextWorkbench:
                 "Scratchpad",
                 self.scratchpad_tokens,
                 self._scratchpad_budget,
-                detail=", ".join(f"{k}={v}" for k, v in self._scratchpad.items()),
+                detail=", ".join(f"{k}={r.value}" for k, r in self._scratchpad.items()),
             ),
         ]
         return WorkbenchSnapshot(

@@ -10,15 +10,16 @@ into that context and **unmounted** to free the space, and workers that talk
 over an NNG message bus. The design lives in `ftw_plan.md`; read it before
 making architectural changes.
 
-**Status:** Phase 0 (protocol + bus + runtime dir) and Phase 1 (providers,
-workbench, agent loop, shell worker, interceptor, REPL) are done. Phase 2
-(skills and mounted frames — the headline feature) is next. See §8 of
-`ftw_plan.md` for the phase list.
+**Status:** Phase 0 (protocol + bus + runtime dir), Phase 1 (providers,
+workbench, agent loop, shell worker, interceptor, REPL), and Phase 2 (skills
+and mounted frames — the headline feature) are done. Phase 3 (delegated
+sub-agent skill runs) is next. See §8 of `ftw_plan.md` for the phase list.
 
 Run it: `uv run ftw` (needs a real key for the `fast`/`smart` tiers in
-`ftw.toml` — `DEEPSEEK_API_KEY` / `NOUS_API_KEY` — until Phase 2's skills
-give it something more interesting to do than chat). `uv run ftw tap`
-streams live events from a running session in another terminal.
+`ftw.toml` — `DEEPSEEK_API_KEY` / `NOUS_API_KEY`). Point `--skills-dir` at
+`examples/skills` to try mounting right away, e.g.
+`uv run ftw --skills-dir examples/skills`. `uv run ftw tap` streams live
+events from a running session in another terminal.
 
 ## Non-negotiables
 

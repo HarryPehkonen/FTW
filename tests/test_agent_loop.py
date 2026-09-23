@@ -11,10 +11,12 @@ from dataclasses import dataclass
 import pytest
 
 from ftw.agent_loop import AgentLoop
+from ftw.frames import FrameTree
 from ftw.intercept import ConfirmShellCommands, InterceptDecision, InterceptOutcome, PreCommitInterceptor
 from ftw.outputs import OutputStore
 from ftw.protocol import CallEnvelope, ErrorEnvelope, ErrorPayload, ResultEnvelope, ResultPayload
 from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
+from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
 
 
@@ -344,6 +346,148 @@ class TestEvents:
             "event.model.request",
             "event.model.response",
         ]
+
+
+def write_skill(root, relpath: str, name: str, description: str, body: str = "do the thing") -> None:
+    path = root / relpath / "SKILL.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n")
+
+
+class TestFrameToolsIntegration:
+    """find_skill/mount_skill/unmount_skill (ftw_plan.md §3.2
+    "Self-Mounting"): local execution (no bus dispatch) but still routed
+    through the interceptor, unlike pin/unpin/read_output/grep_output."""
+
+    def make_loop_with_frames(self, tmp_path, responses, *, interceptor=None, confirm=None):
+        write_skill(tmp_path, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose failing CMake configuration.")
+        store = SkillStore(tmp_path)
+        workbench = ContextWorkbench()
+        tree = FrameTree(workbench, store)
+        loop = AgentLoop(
+            workbench=workbench,
+            provider=MockModelProvider(responses),
+            output_store=OutputStore(tmp_path / "outputs"),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+            interceptor=interceptor or PreCommitInterceptor([]),
+            confirm=confirm,
+            frame_tree=tree,
+        )
+        return loop, tree
+
+    def test_find_skill_returns_matching_names(self, tmp_path):
+        loop, _tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("find_skill", {"query": "cmake configuration"}),
+                assistant_text("found it"),
+            ],
+        )
+        assert loop.run_turn("find a skill") == "found it"
+
+    def test_mount_skill_mounts_into_the_shared_workbench(self, tmp_path):
+        loop, tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}),
+                assistant_text("mounted"),
+            ],
+        )
+        assert loop.run_turn("mount cmake help") == "mounted"
+        assert tree.focused_skill_name == "cmake.diagnose_configure"
+        assert loop.workbench.mounted_skill_tokens > 0
+
+    def test_mount_skill_unknown_name_reports_error_without_crashing(self, tmp_path):
+        loop, _tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "nope.nothing"}),
+                assistant_text("no such skill"),
+            ],
+        )
+        assert loop.run_turn("mount something bogus") == "no such skill"
+
+    def test_unmount_skill_produces_a_milestone(self, tmp_path):
+        loop, tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}),
+                assistant_tool_call("unmount_skill", {"name": "cmake.diagnose_configure"}),
+                assistant_text("done"),
+            ],
+        )
+        assert loop.run_turn("mount then unmount") == "done"
+        assert loop.workbench.mounted_skill_tokens == 0
+        assert len(loop.workbench.milestones) == 1
+
+    def test_frame_tools_go_through_the_interceptor(self, tmp_path):
+        blocked = InterceptOutcome(InterceptDecision.BLOCK, reason="no mounting allowed right now")
+
+        class BlockMounts:
+            def evaluate(self, call):
+                if call.payload.action == "mount_skill":
+                    return blocked
+                return InterceptOutcome(InterceptDecision.ALLOW)
+
+        loop, tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}),
+                assistant_text("blocked as expected"),
+            ],
+            interceptor=PreCommitInterceptor([BlockMounts()]),
+        )
+
+        assert loop.run_turn("try to mount") == "blocked as expected"
+        assert tree.focused_skill_name is None  # never actually mounted
+
+    def test_committed_turn_is_tagged_with_the_focused_frame(self, tmp_path):
+        """Without this tagging, evict_frame() on unmount would find
+        nothing to evict — the whole point of a mount/unmount frame."""
+        loop, tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}),
+                assistant_text("mounted and answered"),
+            ],
+        )
+        loop.run_turn("mount cmake and answer")
+
+        frame = tree._find_by_skill("cmake.diagnose_configure")  # noqa: SLF001 - whitebox
+        evicted = loop.workbench.evict_frame(frame.id)
+        assert len(evicted) == 1  # the committed turn was tagged to the frame that was focused when it committed
+
+    def test_pin_made_while_a_frame_is_focused_is_tagged_to_it(self, tmp_path):
+        loop, tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}),
+                assistant_tool_call("pin", {"key": "finding", "value": "missing openssl"}),
+                assistant_text("noted"),
+            ],
+        )
+        loop.run_turn("mount and note a finding")
+
+        frame = tree._find_by_skill("cmake.diagnose_configure")  # noqa: SLF001 - whitebox
+        evicted_pins = loop.workbench.evict_frame_pins(frame.id)
+        assert evicted_pins == {"finding": "missing openssl"}
+
+    def test_turn_committed_with_nothing_focused_is_untagged(self, tmp_path):
+        loop, _tree = self.make_loop_with_frames(tmp_path, [assistant_text("just chatting")])
+        loop.run_turn("hello")
+        assert loop.workbench.evict_frame("anything") == []  # nothing was tagged to any frame
+        assert len(loop.workbench.turns) == 1  # the turn is still there, just untagged
+
+    def test_agent_loop_without_frame_tree_reports_frame_tools_as_unknown(self, tmp_path):
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider(
+                [assistant_tool_call("mount_skill", {"name": "x"}), assistant_text("no skills here")]
+            ),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+        )
+        assert loop.run_turn("mount x") == "no skills here"
 
 
 class TestErrorReply:

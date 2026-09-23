@@ -202,6 +202,65 @@ class TestRenderPrompt:
         assert prompt[-1] == user("in-progress turn")
 
 
+class TestFrameTagging:
+    """Every turn and pin is tagged with the frame it belongs to (ftw_plan.md
+    §3.2 Frames), so unmounting a frame can evict exactly its own content —
+    and nothing else — from the Turn Horizon and Scratchpad."""
+
+    def test_add_turn_defaults_to_no_frame(self):
+        wb = ContextWorkbench()
+        wb.add_turn([user("hi")])
+        assert wb.turns == [[user("hi")]]
+
+    def test_evict_frame_removes_only_that_frames_turns_in_order(self):
+        wb = ContextWorkbench()
+        wb.add_turn([user("base turn")])
+        wb.add_turn([user("frame turn 1")], frame_id="f1")
+        wb.add_turn([user("other frame")], frame_id="f2")
+        wb.add_turn([user("frame turn 2")], frame_id="f1")
+
+        evicted = wb.evict_frame("f1")
+
+        assert evicted == [[user("frame turn 1")], [user("frame turn 2")]]
+        assert wb.turns == [[user("base turn")], [user("other frame")]]
+
+    def test_evict_frame_with_nothing_tagged_returns_empty(self):
+        wb = ContextWorkbench()
+        wb.add_turn([user("hi")])
+        assert wb.evict_frame("nope") == []
+        assert wb.turns == [[user("hi")]]
+
+    def test_evict_frame_fires_on_turn_evicted_callback(self):
+        evicted = []
+        wb = ContextWorkbench(on_turn_evicted=evicted.append)
+        turn = [user("frame turn")]
+        wb.add_turn(turn, frame_id="f1")
+
+        wb.evict_frame("f1")
+
+        assert evicted == [turn]
+
+    def test_pin_defaults_to_no_frame(self):
+        wb = ContextWorkbench()
+        wb.pin("k", "v")
+        assert wb.scratchpad == {"k": "v"}
+
+    def test_evict_frame_pins_removes_only_that_frames_pins(self):
+        wb = ContextWorkbench()
+        wb.pin("base", "b", frame_id=None)
+        wb.pin("mine", "m", frame_id="f1")
+        wb.pin("other", "o", frame_id="f2")
+
+        evicted = wb.evict_frame_pins("f1")
+
+        assert evicted == {"mine": "m"}
+        assert wb.scratchpad == {"base": "b", "other": "o"}
+
+    def test_mounted_skill_budget_is_readable(self):
+        wb = ContextWorkbench(mounted_skill_budget=1234)
+        assert wb.mounted_skill_budget == 1234
+
+
 class TestSnapshot:
     def test_snapshot_reports_each_zone(self):
         wb = ContextWorkbench(system_anchor="anchor text", user_memory="memory text")

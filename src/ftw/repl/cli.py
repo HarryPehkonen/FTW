@@ -21,11 +21,13 @@ from uuid import uuid4
 from ftw.agent_loop import AgentLoop
 from ftw.bus import Publisher, Requester
 from ftw.config import build_provider, load_config
+from ftw.frames import FrameTree, make_llm_summarizer
 from ftw.intercept import ConfirmShellCommands, PreCommitInterceptor
 from ftw.outputs import OutputStore
 from ftw.providers import IModelProvider
 from ftw.repl.session import InputFn, ReplSession, make_confirm
 from ftw.runtime import ipc_address
+from ftw.skills.registry import SkillStore
 from ftw.trace import TraceWriter
 from ftw.workbench import ContextWorkbench
 
@@ -71,6 +73,7 @@ def build_repl_session(
     input_fn: InputFn = input,
     output: TextIO = sys.stdout,
     system_anchor: str = DEFAULT_SYSTEM_ANCHOR,
+    skills_dir: Path | None = None,
     worker_address: str | None = None,
     worker_startup_grace_s: float = DEFAULT_WORKER_STARTUP_GRACE_S,
 ) -> ReplHandle:
@@ -95,13 +98,18 @@ def build_repl_session(
         trace_writer.write(evt)
         publisher.publish(evt)
 
+    workbench = ContextWorkbench(system_anchor=system_anchor)
+    skill_store = SkillStore(skills_dir or (ftw_home / "skills"))
+    frame_tree = FrameTree(workbench, skill_store, summarizer=make_llm_summarizer(provider))
+
     loop = AgentLoop(
-        workbench=ContextWorkbench(system_anchor=system_anchor),
+        workbench=workbench,
         provider=provider,
         output_store=OutputStore(output_root),
         dispatch=requester.call,
         interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
         confirm=make_confirm(input_fn, output),
+        frame_tree=frame_tree,
         on_event=on_event,
     )
     session = ReplSession(agent_loop=loop, input_fn=input_fn, output=output)
@@ -114,6 +122,7 @@ def _run_repl(args: argparse.Namespace) -> None:
         ftw_home=Path(args.ftw_home),
         config_path=Path(args.config),
         tier=args.tier,
+        skills_dir=Path(args.skills_dir) if args.skills_dir else None,
     )
     try:
         handle.session.run()
@@ -144,6 +153,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", default="ftw.toml")
     parser.add_argument("--tier", default="fast")
     parser.add_argument("--ftw-home", default=str(Path.home() / ".ftw"))
+    parser.add_argument("--skills-dir", default=None, help="defaults to <ftw-home>/skills")
     _run_repl(parser.parse_args(argv))
 
 
