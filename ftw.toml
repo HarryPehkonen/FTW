@@ -1,0 +1,40 @@
+# FTW runtime configuration (ftw_plan.md §6).
+#
+# API keys are read from these environment variables at startup — never
+# written here. List a provider's available models before picking one:
+#   curl -s https://api.deepseek.com/models -H "Authorization: Bearer $DEEPSEEK_API_KEY" | jq .
+#   curl -s https://inference-api.nousresearch.com/v1/models | jq '.data[].id'
+
+[providers.deepseek]
+kind = "openai_compatible"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[providers.nous]
+kind = "openai_compatible"
+base_url = "https://inference-api.nousresearch.com/v1"
+api_key_env = "NOUS_API_KEY"
+
+# Any OpenAI-compatible local runtime (llama.cpp, vLLM, Ollama's /v1 endpoint).
+# No api_key_env: local runtimes take no auth by default.
+[providers.local]
+kind = "openai_compatible"
+base_url = "http://localhost:8080/v1"
+
+[providers.mock]
+kind = "openai_compatible"
+base_url = "http://localhost:0/v1"  # never dialed; use MockModelProvider directly instead
+
+# Tiers are the aliases the REPL and skills refer to as `model: fast`, etc.
+# TODO: pick real model ids before first use — these are placeholders.
+[tiers.fast]
+provider = "deepseek"
+model = "deepseek-chat"
+
+[tiers.smart]
+provider = "nous"
+model = "REPLACE_ME"  # e.g. one of the ids from the Nous /v1/models listing above
+
+[tiers.local]
+provider = "local"
+model = "REPLACE_ME"  # whatever model your local runtime has loaded
