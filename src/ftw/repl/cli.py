@@ -25,9 +25,10 @@ from ftw.frames import FrameTree, make_llm_summarizer
 from ftw.intercept import ConfirmShellCommands, PreCommitInterceptor
 from ftw.outputs import OutputStore
 from ftw.providers import IModelProvider
-from ftw.repl.session import InputFn, ReplSession, make_confirm
+from ftw.repl.session import InputFn, ReplSession, make_ask_answerer, make_confirm
 from ftw.runtime import ipc_address
 from ftw.skills.registry import SkillStore
+from ftw.skills.runner import control_address as skill_runner_control_address
 from ftw.trace import TraceWriter
 from ftw.workbench import ContextWorkbench
 
@@ -129,11 +130,13 @@ class ReplHandle:
     _shell_requester: Requester
     _skill_runner_proc: subprocess.Popen
     _skill_runner_requester: Requester
+    _skill_runner_control_requester: Requester
     _publisher: Publisher
 
     def close(self) -> None:
         self._shell_requester.close()
         self._skill_runner_requester.close()
+        self._skill_runner_control_requester.close()
         self._publisher.close()
         _stop_worker(self._shell_worker_proc)
         _stop_worker(self._skill_runner_proc)
@@ -181,6 +184,7 @@ def build_repl_session(
     )
     _wait_for_worker_or_crash(skill_runner_proc, grace_s=worker_startup_grace_s, name="skill runner")
     skill_runner_requester = Requester(skill_runner_address)
+    skill_runner_control_requester = Requester(skill_runner_control_address(skill_runner_address))
 
     trace_writer = TraceWriter(traces_root)
     publisher = Publisher(ipc_address(f"events.{uuid4().hex[:8]}"))
@@ -202,6 +206,8 @@ def build_repl_session(
         dispatch=dispatch,
         interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
         confirm=make_confirm(input_fn, output),
+        ask_answerer=make_ask_answerer(input_fn, output),
+        control_dispatch=skill_runner_control_requester.call,
         frame_tree=frame_tree,
         skill_runner_target=SKILL_RUNNER_TARGET,
         on_event=on_event,
@@ -214,6 +220,7 @@ def build_repl_session(
         _shell_requester=shell_requester,
         _skill_runner_proc=skill_runner_proc,
         _skill_runner_requester=skill_runner_requester,
+        _skill_runner_control_requester=skill_runner_control_requester,
         _publisher=publisher,
     )
 

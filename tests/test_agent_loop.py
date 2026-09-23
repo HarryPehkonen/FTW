@@ -6,11 +6,12 @@ a fresh workbench. Everything here runs against MockModelProvider and a
 recording fake dispatcher — no bus, no network, no live tokens.
 """
 
+import threading
 from dataclasses import dataclass
 
 import pytest
 
-from ftw.agent_loop import AgentLoop
+from ftw.agent_loop import AgentLoop, DelegatedSuspension
 from ftw.frames import FrameTree
 from ftw.intercept import ConfirmShellCommands, InterceptDecision, InterceptOutcome, PreCommitInterceptor
 from ftw.outputs import OutputStore
@@ -665,6 +666,252 @@ class TestRunDelegated:
             dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
         )
         assert "submit_result" not in {t.name for t in interactive._tool_specs}  # noqa: SLF001
+
+
+class TestDelegatedAskPassthrough:
+    """A delegated run's own interceptor ASK (e.g. a shell command it
+    proposes needs confirmation) can't block on a local confirm() — there's
+    no human at that process. run_delegated suspends instead, returning a
+    DelegatedSuspension the caller relays; resume_delegated continues from
+    exactly where it paused once an answer arrives (ftw_plan.md §8 Phase 3
+    "ASK passthrough to the REPL")."""
+
+    def make_loop(self, tmp_path, responses, dispatch=None, **kwargs):
+        return AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider(responses),
+            output_store=OutputStore(tmp_path),
+            dispatch=dispatch or (lambda call: (_ for _ in ()).throw(AssertionError("must not dispatch before an answer"))),
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+            enable_delegated_completion=True,
+            **kwargs,
+        )
+
+    def test_run_delegated_suspends_instead_of_blocking(self, tmp_path):
+        loop = self.make_loop(tmp_path, [assistant_tool_call("run_command", {"argv": ["rm", "-rf", "build"]})])
+
+        outcome = loop.run_delegated("clean the build dir")
+
+        assert isinstance(outcome, DelegatedSuspension)
+        assert outcome.ask.payload.resume_token
+        assert outcome.ask.payload.question
+
+    def test_resume_with_true_dispatches_and_continues(self, tmp_path):
+        dispatcher = RecordingDispatcher([ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0"))])
+        loop = self.make_loop(
+            tmp_path,
+            [assistant_tool_call("run_command", {"argv": ["rm", "-rf", "build"]}), submit_result_call(summary="cleaned")],
+            dispatch=dispatcher,
+        )
+        suspension = loop.run_delegated("clean the build dir")
+
+        outcome = loop.resume_delegated(suspension, True)
+
+        assert isinstance(outcome, ResultPayload)
+        assert outcome.status == "ok"
+        assert outcome.summary == "cleaned"
+        assert len(dispatcher.calls) == 1
+        assert dispatcher.calls[0].payload.action == "run_command"
+
+    def test_resume_with_false_declines_and_continues(self, tmp_path):
+        loop = self.make_loop(
+            tmp_path,
+            [assistant_tool_call("run_command", {"argv": ["rm", "-rf", "build"]}), submit_result_call(summary="left it alone")],
+        )
+        suspension = loop.run_delegated("clean the build dir")
+
+        outcome = loop.resume_delegated(suspension, False)
+
+        assert isinstance(outcome, ResultPayload)
+        assert outcome.summary == "left it alone"
+
+    def test_second_call_in_same_batch_runs_after_the_first_is_answered(self, tmp_path):
+        dispatcher = RecordingDispatcher([ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0"))])
+        response = ProviderResponse(
+            message=ChatMessage(
+                role=ChatRole.ASSISTANT,
+                content=None,
+                tool_calls=[
+                    ToolCall(id="a", name="run_command", arguments={"argv": ["rm", "x"]}),
+                    ToolCall(id="b", name="pin", arguments={"key": "k", "value": "v"}),
+                ],
+            )
+        )
+        loop = self.make_loop(tmp_path, [response, submit_result_call(summary="done")], dispatch=dispatcher)
+
+        suspension = loop.run_delegated("go")
+        outcome = loop.resume_delegated(suspension, True)
+
+        assert isinstance(outcome, ResultPayload)
+        assert loop.workbench.scratchpad == {"k": "v"}  # the second tool_call in the batch still ran
+
+    def test_a_second_ask_in_a_later_step_produces_a_new_suspension(self, tmp_path):
+        loop = self.make_loop(
+            tmp_path,
+            [
+                assistant_tool_call("run_command", {"argv": ["rm", "a"]}, call_id="a"),
+                assistant_tool_call("run_command", {"argv": ["rm", "b"]}, call_id="b"),
+                submit_result_call(summary="both removed"),
+            ],
+            dispatch=RecordingDispatcher(
+                [
+                    ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0")),
+                    ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0")),
+                ]
+            ),
+        )
+
+        first = loop.run_delegated("clean up")
+        assert isinstance(first, DelegatedSuspension)
+        second = loop.resume_delegated(first, True)
+        assert isinstance(second, DelegatedSuspension)
+        assert second.ask.payload.resume_token != first.ask.payload.resume_token
+        third = loop.resume_delegated(second, True)
+        assert isinstance(third, ResultPayload)
+        assert third.summary == "both removed"
+
+    def test_cost_is_still_reported_after_a_suspend_and_resume(self, tmp_path):
+        loop = self.make_loop(
+            tmp_path,
+            [assistant_tool_call("run_command", {"argv": ["rm", "x"]}), submit_result_call(summary="done")],
+            dispatch=RecordingDispatcher([ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0"))]),
+        )
+        suspension = loop.run_delegated("go")
+        outcome = loop.resume_delegated(suspension, True)
+        assert "wall_time_ms" in outcome.cost
+
+
+class TestDelegatedCancellation:
+    """Cooperative cancellation: checked between steps, since a blocked
+    provider.complete() call can't be preempted."""
+
+    def test_cancel_flag_set_before_starting_aborts_immediately(self, tmp_path):
+        flag = threading.Event()
+        flag.set()
+        provider = MockModelProvider([submit_result_call()])
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=provider,
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+            enable_delegated_completion=True,
+        )
+
+        result = loop.run_delegated("go", cancel_flag=flag)
+
+        assert result.status == "error"
+        assert "cancel" in result.summary.lower()
+        assert provider.calls == []  # never even asked the model
+
+    def test_cancel_flag_set_between_steps_stops_before_the_next_one(self, tmp_path):
+        flag = threading.Event()
+
+        class SetsFlagAfterFirstCall(MockModelProvider):
+            def complete(self, messages, tools=None):
+                response = super().complete(messages, tools)
+                flag.set()
+                return response
+
+        provider = SetsFlagAfterFirstCall(
+            [assistant_tool_call("pin", {"key": "k", "value": "v"}), submit_result_call(summary="should not get here")]
+        )
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=provider,
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+            enable_delegated_completion=True,
+        )
+
+        result = loop.run_delegated("go", cancel_flag=flag)
+
+        assert result.status == "error"
+        assert "cancel" in result.summary.lower()
+        assert len(provider.calls) == 1  # stopped before the second step
+
+    def test_resume_also_respects_a_cancel_flag(self, tmp_path):
+        flag = threading.Event()
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider([assistant_tool_call("run_command", {"argv": ["x"]})]),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+            enable_delegated_completion=True,
+        )
+        suspension = loop.run_delegated("go", cancel_flag=flag)
+        flag.set()
+
+        result = loop.resume_delegated(suspension, True)
+
+        assert result.status == "error"
+        assert "cancel" in result.summary.lower()
+
+
+class TestKeyboardInterruptDuringDispatch:
+    """If a KeyboardInterrupt is ever raised while dispatching a bus call
+    (whatever the trigger — see bus.py's Requester.call() docstring for
+    the current limitation on Ctrl-C specifically getting one raised
+    promptly), it must be handled cleanly: notify the worker via
+    control_dispatch, report the tool call as cancelled, and let the loop
+    continue rather than crashing the whole session."""
+
+    def test_notifies_via_control_dispatch_and_reports_cancelled(self, tmp_path):
+        control_calls = []
+
+        def dispatch(call):
+            raise KeyboardInterrupt()
+
+        def control_dispatch(envelope):
+            control_calls.append(envelope)
+            return ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="cancel requested"))
+
+        loop = make_loop(
+            responses=[
+                assistant_tool_call("run_command", {"argv": ["sleep", "100"]}),
+                assistant_text("cancelled that for you"),
+            ],
+            dispatch=dispatch,
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+        loop._control_dispatch = control_dispatch  # noqa: SLF001 - whitebox: no public setter, and shouldn't need one
+
+        result = loop.run_turn("run something long")
+
+        assert result == "cancelled that for you"
+        assert len(control_calls) == 1
+        assert control_calls[0].payload.target_span_id
+        assert control_calls[0].payload.reason == "Ctrl-C"
+
+    def test_still_reports_cancelled_when_no_control_dispatch_is_configured(self, tmp_path):
+        loop = make_loop(
+            responses=[
+                assistant_tool_call("run_command", {"argv": ["sleep", "100"]}),
+                assistant_text("okay, stopped"),
+            ],
+            dispatch=lambda call: (_ for _ in ()).throw(KeyboardInterrupt()),
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+        assert loop.run_turn("run something long") == "okay, stopped"
+
+    def test_a_failing_control_dispatch_does_not_crash_the_loop(self, tmp_path):
+        def control_dispatch(envelope):
+            raise ConnectionError("worker unreachable")
+
+        loop = make_loop(
+            responses=[
+                assistant_tool_call("run_command", {"argv": ["sleep", "100"]}),
+                assistant_text("gave up cleanly"),
+            ],
+            dispatch=lambda call: (_ for _ in ()).throw(KeyboardInterrupt()),
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+        loop._control_dispatch = control_dispatch  # noqa: SLF001
+
+        assert loop.run_turn("run something long") == "gave up cleanly"
 
 
 class TestWorkerInitiatedAskRelay:

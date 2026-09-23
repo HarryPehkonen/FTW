@@ -298,3 +298,114 @@ class TestDelegatedSkillRealSubprocess:
         tool_messages = [m for m in workbench.turns[0] if m.role == ChatRole.TOOL]
         assert len(tool_messages) == 1
         assert "gcc 13 is installed" in tool_messages[0].content
+
+    def test_delegated_run_asking_for_confirmation_is_relayed_across_the_real_subprocess_boundary(self, tmp_path):
+        """The skill-runner subprocess's own interceptor asks for
+        confirmation before running a shell command; that ASK crosses back
+        to this process, gets answered here (scripted 'y'), and the answer
+        crosses back to resume the *same* subprocess run — proving ASK
+        passthrough end to end, not just at the unit level."""
+        skills_dir = tmp_path / "skills"
+        write_skill(skills_dir, "cmake/clean_build", "cmake.clean_build", "Clean stale CMake build artifacts.")
+
+        server = start_mock_model_server(
+            [
+                openai_tool_call_response("run_command", {"argv": [sys.executable, "-c", "print('removed build/')"]}),
+                openai_tool_call_response("submit_result", {"status": "ok", "summary": "Removed stale build artifacts."}),
+            ]
+        )
+        try:
+            config_path = tmp_path / "ftw.toml"
+            config_path.write_text(
+                f"""
+                [providers.mock_http]
+                kind = "openai_compatible"
+                base_url = "http://127.0.0.1:{server.server_port}/v1"
+
+                [tiers.fast]
+                provider = "mock_http"
+                model = "mock-model"
+                """
+            )
+
+            main_provider = MockModelProvider(
+                [
+                    tool_call_response("delegate_skill", {"name": "cmake.clean_build", "brief": "clean the build dir"}, "d1"),
+                    text_response("Build directory cleaned."),
+                ]
+            )
+            out = io.StringIO()
+            handle = build_repl_session(
+                ftw_home=tmp_path,
+                skills_dir=skills_dir,
+                config_path=config_path,
+                provider=main_provider,
+                input_fn=ScriptedInput(["y"]),  # answers the relayed ASK
+                output=out,
+            )
+            try:
+                reply = handle.session.agent_loop.run_turn("clean the build directory")
+            finally:
+                handle.close()
+        finally:
+            server.shutdown()
+
+        assert reply == "Build directory cleaned."
+        assert "shell commands require confirmation" in out.getvalue()  # the relayed ASK was actually shown here
+
+
+class TestCancelRealSubprocess:
+    """Proves the control channel (ftw_plan.md §4: CANCEL on a separate
+    ``<service>.ctl`` socket, "so a busy call channel can't block it") is a
+    genuinely separate, working NNG socket in the real skill-runner
+    subprocess — not just exercised in-process against the worker object
+    directly, the way test_skills_runner.py's TestCancel does."""
+
+    def test_cancel_over_the_real_control_channel_aborts_a_real_subprocess_run(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        write_skill(skills_dir, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose CMake.")
+
+        # A provider that's never actually dialed: the cancel is checked
+        # before the first model call, so no live endpoint is needed here.
+        config_path = tmp_path / "ftw.toml"
+        config_path.write_text(
+            """
+            [providers.stub]
+            kind = "openai_compatible"
+            base_url = "http://127.0.0.1:1/v1"
+
+            [tiers.fast]
+            provider = "stub"
+            model = "unused"
+            """
+        )
+
+        handle = build_repl_session(
+            ftw_home=tmp_path,
+            skills_dir=skills_dir,
+            config_path=config_path,
+            provider=MockModelProvider([]),  # the main REPL loop isn't exercised in this test
+            input_fn=ScriptedInput([]),
+            output=io.StringIO(),
+        )
+        try:
+            from ftw.protocol import CallEnvelope, CallPayload, CancelEnvelope, CancelPayload, ResultEnvelope
+
+            span_id = "known-span-for-cancel-test"
+            cancel = CancelEnvelope(source="repl.master", target="skill.runner", payload=CancelPayload(target_span_id=span_id))
+            cancel_reply = handle._skill_runner_control_requester.call(cancel)  # noqa: SLF001 - whitebox: exercising the real control socket directly
+            assert isinstance(cancel_reply, ResultEnvelope)
+
+            call = CallEnvelope(
+                source="repl.master",
+                target="skill.runner",
+                span_id=span_id,
+                payload=CallPayload(action="delegate_skill", args={"name": "cmake.diagnose_configure", "brief": "go"}),
+            )
+            reply = handle._skill_runner_requester.call(call)  # noqa: SLF001
+        finally:
+            handle.close()
+
+        assert isinstance(reply, ResultEnvelope)
+        assert reply.payload.status == "error"
+        assert "cancel" in reply.payload.summary.lower()

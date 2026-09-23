@@ -5,6 +5,8 @@ idempotency_key, an ASK/ANSWER round trip, REQ resend being disabled, and a
 small ipc:// integration test including stale-socket cleanup.
 """
 
+import os
+import signal
 import threading
 import time
 
@@ -106,6 +108,43 @@ class TestDeadlineHandling:
                     err = exc.to_error_envelope(source=call.target, target=call.source)
             assert err.payload.code == "deadline_exceeded"
             stop.set()
+
+
+class TestRecvIsInterruptible:
+    """A single long blocking recv() can't be interrupted by a real
+    Ctrl-C: pynng's send()/recv() don't release the GIL, so no thread —
+    not even a background one running the same call — gets a chance to
+    process a pending signal until the call itself returns. Confirmed
+    empirically; a naive short-poll retry loop was tried and reverted
+    because retrying recv() on the same Req0 socket after a timeout hits
+    a separate pynng bug (BadState). Fixing this for real needs resend +
+    idempotency-key-based retry (bus.py's Requester already disables
+    resend outright for the correctness reasons in its own docstring), so
+    it's real, separate work, not a quick patch alongside this one. This
+    test documents the gap and will start passing on its own once that
+    lands — see Requester.call()'s docstring."""
+
+    @pytest.mark.xfail(reason="pynng's recv() doesn't release the GIL; see class docstring", strict=True)
+    def test_a_real_sigint_interrupts_a_long_wait_promptly(self, unique_name):
+        addr = inproc_address(unique_name)
+        # No Replier bound — send() succeeds (inproc dial always "succeeds"
+        # even with nothing listening; see bus.py's docstring), but no
+        # reply will ever arrive, so recv() would otherwise block for the
+        # full timeout below.
+        with Requester(addr) as req:
+
+            def send_sigint_soon():
+                time.sleep(0.3)
+                os.kill(os.getpid(), signal.SIGINT)
+
+            threading.Thread(target=send_sigint_soon, daemon=True).start()
+
+            start = time.monotonic()
+            with pytest.raises(KeyboardInterrupt):
+                req.call(make_call(), timeout_ms=2000)
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0  # interrupted well before the 2s deadline
 
 
 class TestIdempotencyDedupe:

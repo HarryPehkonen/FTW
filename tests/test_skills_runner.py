@@ -10,8 +10,20 @@ import sys
 import threading
 
 from ftw.bus import Replier, Requester
+from ftw.intercept import ConfirmShellCommands, PreCommitInterceptor
 from ftw.outputs import OutputStore
-from ftw.protocol import CallEnvelope, CallPayload, ErrorEnvelope, ResultEnvelope
+from ftw.protocol import (
+    AnswerEnvelope,
+    AnswerPayload,
+    AskEnvelope,
+    CallEnvelope,
+    CallPayload,
+    CancelEnvelope,
+    CancelPayload,
+    ErrorEnvelope,
+    ResultEnvelope,
+    ResultPayload,
+)
 from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
 from ftw.runtime import inproc_address
 from ftw.skills.registry import SkillStore
@@ -173,6 +185,122 @@ class TestSkillRunnerWorker:
 
         assert len(calls) == 1
         assert calls[0].payload.action == "run_command"
+
+
+def run_command_response(argv, call_id="r1") -> ProviderResponse:
+    return ProviderResponse(
+        message=ChatMessage(role=ChatRole.ASSISTANT, content=None, tool_calls=[ToolCall(id=call_id, name="run_command", arguments={"argv": argv})])
+    )
+
+
+class TestAskPassthrough:
+    """A delegated run's own interceptor ASK can't block — there's no
+    human at this process. handle() replies with an AskEnvelope instead
+    of blocking; the matching AnswerEnvelope resumes it (ftw_plan.md §8
+    Phase 3 "ASK passthrough to the REPL")."""
+
+    def make_worker(self, tmp_path, responses, dispatch=None) -> SkillRunnerWorker:
+        write_skill(tmp_path / "skills", "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose CMake.")
+        store = SkillStore(tmp_path / "skills")
+        return SkillRunnerWorker(
+            store,
+            provider_factory=lambda tier: MockModelProvider(responses),
+            output_store=OutputStore(tmp_path / "outputs"),
+            dispatch=dispatch or (lambda call: (_ for _ in ()).throw(AssertionError("must not dispatch before an answer"))),
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+        )
+
+    def test_call_that_needs_confirmation_returns_ask_not_result(self, tmp_path):
+        worker = self.make_worker(tmp_path, [run_command_response(["rm", "-rf", "x"])])
+
+        reply = worker.handle(delegate_skill_call("cmake.diagnose_configure"))
+
+        assert isinstance(reply, AskEnvelope)
+        assert reply.payload.resume_token
+        assert reply.payload.question
+
+    def test_answering_yes_dispatches_and_completes(self, tmp_path):
+        dispatcher_calls = []
+
+        def dispatch(call):
+            dispatcher_calls.append(call)
+            return ResultEnvelope(source=call.target, target=call.source, payload=ResultPayload(status="ok", summary="exit 0"))
+
+        worker = self.make_worker(tmp_path, [run_command_response(["rm", "-rf", "x"]), submit_result_response(summary="cleaned")], dispatch=dispatch)
+
+        ask = worker.handle(delegate_skill_call("cmake.diagnose_configure"))
+        answer = AnswerEnvelope(source="repl.master", target="skill.runner", payload=AnswerPayload(resume_token=ask.payload.resume_token, value=True))
+        reply = worker.handle(answer)
+
+        assert isinstance(reply, ResultEnvelope)
+        assert reply.payload.summary == "cleaned"
+        assert len(dispatcher_calls) == 1
+
+    def test_answering_no_declines_and_completes(self, tmp_path):
+        worker = self.make_worker(tmp_path, [run_command_response(["rm", "-rf", "x"]), submit_result_response(summary="left alone")])
+
+        ask = worker.handle(delegate_skill_call("cmake.diagnose_configure"))
+        answer = AnswerEnvelope(source="repl.master", target="skill.runner", payload=AnswerPayload(resume_token=ask.payload.resume_token, value=False))
+        reply = worker.handle(answer)
+
+        assert isinstance(reply, ResultEnvelope)
+        assert reply.payload.summary == "left alone"
+
+    def test_unknown_resume_token_returns_a_clear_error(self, tmp_path):
+        worker = self.make_worker(tmp_path, [])
+        answer = AnswerEnvelope(source="repl.master", target="skill.runner", payload=AnswerPayload(resume_token="nope", value=True))
+
+        reply = worker.handle(answer)
+
+        assert isinstance(reply, ErrorEnvelope)
+        assert reply.payload.code == "unknown_resume_token"
+
+    def test_the_result_still_only_carries_the_structured_payload(self, tmp_path):
+        worker = self.make_worker(
+            tmp_path,
+            [run_command_response(["rm", "-rf", "x"]), submit_result_response(summary="cleaned", outputs={"removed": True})],
+            dispatch=lambda call: ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0")),
+        )
+        ask = worker.handle(delegate_skill_call("cmake.diagnose_configure"))
+        answer = AnswerEnvelope(source="repl.master", target="skill.runner", payload=AnswerPayload(resume_token=ask.payload.resume_token, value=True))
+
+        reply = worker.handle(answer)
+
+        assert set(reply.payload.model_dump().keys()) == {"status", "summary", "outputs", "evidence", "cost"}
+
+
+class TestCancel:
+    def make_worker(self, tmp_path, responses) -> SkillRunnerWorker:
+        write_skill(tmp_path / "skills", "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose CMake.")
+        store = SkillStore(tmp_path / "skills")
+        return SkillRunnerWorker(
+            store,
+            provider_factory=lambda tier: MockModelProvider(responses),
+            output_store=OutputStore(tmp_path / "outputs"),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+        )
+
+    def test_cancel_before_the_call_starts_aborts_it_immediately(self, tmp_path):
+        worker = self.make_worker(tmp_path, [submit_result_response()])
+        call = delegate_skill_call("cmake.diagnose_configure", span_id="known-span")
+
+        cancel_reply = worker.handle_cancel(
+            CancelEnvelope(source="repl.master", target="skill.runner", payload=CancelPayload(target_span_id="known-span"))
+        )
+        assert isinstance(cancel_reply, ResultEnvelope)
+
+        reply = worker.handle(call)
+
+        assert isinstance(reply, ResultEnvelope)
+        assert reply.payload.status == "error"
+        assert "cancel" in reply.payload.summary.lower()
+
+    def test_cancel_for_an_unknown_span_id_is_a_harmless_no_op(self, tmp_path):
+        worker = self.make_worker(tmp_path, [])
+        reply = worker.handle_cancel(
+            CancelEnvelope(source="repl.master", target="skill.runner", payload=CancelPayload(target_span_id="nope"))
+        )
+        assert isinstance(reply, ResultEnvelope)  # acknowledged, not an error, even though nothing was cancelled
 
 
 class TestSkillRunnerOverBus:

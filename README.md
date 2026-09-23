@@ -62,6 +62,11 @@ outputs/evidence it reports) comes back. This is the tool to reach for when
 a task is well-scoped enough to run unsupervised rather than worked through
 turn by turn.
 
+If the delegated task needs to run a shell command, it asks for
+confirmation exactly like an ordinary command would — that question is
+relayed back to you here, and your answer resumes the delegated run right
+where it paused.
+
 ## Skills
 
 A skill is a directory containing a `SKILL.md`: YAML frontmatter (name,

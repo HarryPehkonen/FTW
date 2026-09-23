@@ -11,11 +11,11 @@ stdout) plus worker supervision.
 from __future__ import annotations
 
 import sys
-from typing import Callable, TextIO
+from typing import Any, Callable, TextIO
 
 from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameError
-from ftw.protocol import CallEnvelope
+from ftw.protocol import AskEnvelope, CallEnvelope
 from ftw.skills.registry import SkillNotFound
 
 InputFn = Callable[[str], str]
@@ -37,6 +37,33 @@ def make_confirm(input_fn: InputFn, output: TextIO) -> Callable[[CallEnvelope], 
         return answer.strip().lower() in ("y", "yes")
 
     return confirm
+
+
+def make_ask_answerer(input_fn: InputFn, output: TextIO) -> Callable[[AskEnvelope], Any]:
+    """Builds an AgentLoop ``ask_answerer`` callback: answers a
+    worker-initiated ASK (ftw_plan.md §4 "Mid-call interaction") over the
+    same input/output the REPL prompt uses. A delegated run's own
+    interceptor ASK surfaces to the REPL exactly this way too — this is
+    what makes it answerable at all. Yes/no reads as a bool (matching the
+    common "confirm this action" case); anything else is passed through
+    as free text, for a worker asking something other than yes/no. Fails
+    closed on EOF, same as make_confirm."""
+
+    def answerer(ask: AskEnvelope) -> Any:
+        print(f"{ask.payload.question} ", end="", file=output)
+        try:
+            answer = input_fn("")
+        except EOFError:
+            print("(EOF — declining)", file=output)
+            return False
+        stripped = answer.strip()
+        if stripped.lower() in ("y", "yes"):
+            return True
+        if stripped.lower() in ("n", "no", ""):
+            return False
+        return stripped
+
+    return answerer
 
 
 class ReplSession:

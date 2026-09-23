@@ -81,6 +81,15 @@ class Requester:
         return self._socket.resend_time
 
     def call(self, envelope: AnyEnvelope, timeout_ms: int | None = None) -> AnyEnvelope:
+        # NOTE: a real Ctrl-C during this call is not reliably delivered.
+        # pynng's blocking send()/recv() don't release the GIL, so no
+        # thread — not even a background one running this same call — gets
+        # a chance to process a pending signal until the call itself
+        # returns (confirmed empirically). A short-poll retry loop was
+        # tried and reverted: retrying recv() on the same Req0 socket after
+        # a timeout hits a separate pynng bug (BadState) unless paired with
+        # resend + idempotency-key-based retry, which is real, separate
+        # work — see agent_loop.py's _send_cancel docstring.
         timeout = timeout_ms if timeout_ms is not None else (envelope.deadline_ms or self._default_timeout_ms)
         self._socket.send_timeout = timeout
         self._socket.recv_timeout = timeout

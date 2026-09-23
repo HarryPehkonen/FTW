@@ -10,16 +10,29 @@ into that context and **unmounted** to free the space, and workers that talk
 over an NNG message bus. The design lives in `ftw_plan.md`; read it before
 making architectural changes.
 
-**Status:** Phase 0, Phase 1, and Phase 2 (skills and mounted frames — the
-headline feature) are done. Phase 3 (delegated sub-agent skill runs) is
-partially done: a skill can run as an isolated sub-task in its own
-subprocess with a fresh, isolated workbench, and the caller's context grows
-only by its structured `Result` (`delegate_skill`, driven by
-`AgentLoop.run_delegated` + `skills/runner.py`). Not yet built: a delegated
-run's own interceptor decisions default to an empty (always-allow) policy —
-there's no local human at that process to ask, and relaying an `ASK` back
-through the caller to a real human mid-run is the natural next slice, along
-with `CANCEL` on Ctrl-C. See §8 of `ftw_plan.md` for the phase list.
+**Status:** Phase 0 through Phase 3 are done, including delegated skill
+runs (`delegate_skill`, driven by `AgentLoop.run_delegated` +
+`skills/runner.py`): a skill runs as an isolated sub-task in its own
+subprocess with a fresh, isolated workbench, the caller's context grows
+only by its structured `Result`, a delegated run's own interceptor ASK
+suspends and relays back through the caller to a real human instead of
+blocking (`AgentLoop.resume_delegated`, `DelegatedSuspension`), and
+`CANCEL` on a separate control channel (`<address>.ctl`) cooperatively
+aborts an in-flight run between steps — all fully built and tested via the
+control channel directly. Phase 4 (interceptor policy beyond "confirm
+every shell command", deterministic verifiers) is next. See §8 of
+`ftw_plan.md` for the phase list.
+
+**Known gap:** Ctrl-C does not reliably trigger that CANCEL. Confirmed
+empirically (see `tests/test_bus.py::TestRecvIsInterruptible`, marked
+`xfail`): pynng's blocking `send()`/`recv()` don't release the GIL, so no
+thread — not even a background one running the same call — gets a chance
+to process a pending SIGINT until the call itself returns. A short-poll
+retry loop was tried and reverted: retrying `recv()` on the same `Req0`
+socket after a timeout hits a separate pynng bug (`BadState`). A real fix
+needs resend- and idempotency-key-based retry in `bus.Requester.call()`
+(`resend_time` is disabled outright today, for the correctness reasons in
+that class's own docstring) — real, separate work, not a quick patch.
 
 Run it: `uv run ftw` (needs a real key for the `fast`/`smart` tiers in
 `ftw.toml` — `DEEPSEEK_API_KEY` / `NOUS_API_KEY`). Point `--skills-dir` at

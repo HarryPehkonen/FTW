@@ -14,8 +14,8 @@ from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameTree
 from ftw.outputs import OutputStore
 from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse
-from ftw.protocol import CallEnvelope
-from ftw.repl.session import ReplSession, make_confirm
+from ftw.protocol import AskEnvelope, AskPayload, CallEnvelope
+from ftw.repl.session import ReplSession, make_ask_answerer, make_confirm
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
 
@@ -230,3 +230,31 @@ class TestMakeConfirm:
     def test_confirm_fails_closed_on_eof(self):
         confirm = make_confirm(ScriptedInput([]), io.StringIO())
         assert confirm(self._call()) is False
+
+
+class TestMakeAskAnswerer:
+    """Answers a worker-initiated ASK (ftw_plan.md §4 "Mid-call
+    interaction") — distinct from make_confirm, which answers the
+    interceptor's pre-dispatch ASK. Used both for a worker asking
+    something directly and, identically from the REPL's point of view,
+    for a delegated run's own interceptor ASK relayed back as one."""
+
+    def _ask(self, question: str = "Overwrite build/CMakeCache.txt?") -> AskEnvelope:
+        return AskEnvelope(
+            source="skill.runner", target="repl.master", payload=AskPayload(question=question, resume_token="tok-1")
+        )
+
+    @pytest.mark.parametrize("answer,expected", [("y", True), ("yes", True), ("Y", True), ("n", False), ("", False)])
+    def test_yes_no_answers_become_booleans(self, answer, expected):
+        out = io.StringIO()
+        answerer = make_ask_answerer(ScriptedInput([answer]), out)
+        assert answerer(self._ask()) is expected
+        assert "Overwrite" in out.getvalue()
+
+    def test_free_text_answer_is_passed_through_as_is(self):
+        answerer = make_ask_answerer(ScriptedInput(["/tmp/alt-build-dir"]), io.StringIO())
+        assert answerer(self._ask("Which directory should I use?")) == "/tmp/alt-build-dir"
+
+    def test_fails_closed_on_eof(self):
+        answerer = make_ask_answerer(ScriptedInput([]), io.StringIO())
+        assert answerer(self._ask()) is False
