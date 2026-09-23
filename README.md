@@ -49,6 +49,9 @@ The model can also find, mount, and unmount skills itself (`find_skill`,
 all without your involvement unless you step in with the commands above.
 Shell commands the model proposes are confirmed with you before they run.
 
+The prompt supports normal line editing and history (arrow keys, `Ctrl-R`
+search) on POSIX systems.
+
 ## Skills
 
 A skill is a directory containing a `SKILL.md`: YAML frontmatter (name,

@@ -495,3 +495,11 @@ Each phase is executed with strict Test-Driven Development (TDD) and finishes wi
 - Reference C++17 worker implementation using `libnng` conforming to `schemas/`.
 - Experimental Holographic Reduced Representation (HRR) vector index for sub-millisecond pre-commit anti-pattern matching.
 - **Deliverable:** Polyglot bus demonstration: Python REPL coordinates task execution across both Python and C++ workers.
+
+---
+
+## 9. Future Enhancements (Not Yet Scheduled)
+
+Candidate work that doesn't fit a specific phase above — cross-cutting or dependent on how the framework feels in practice once there's more to mount and run.
+
+- **Streaming model output.** `IModelProvider.complete()` is a single blocking call today: on a large reasoning model or a loaded local runtime, the REPL sits frozen for several seconds with no feedback. The `PROGRESS` envelope type (§4) is already reserved for this. Doing it properly touches three places at once — a streaming variant of the provider interface, `MockModelProvider` scripting token deltas deterministically (not just final responses) so it stays testable, and the REPL rendering partial output as it arrives — so it's sized as its own piece of work, not a small patch alongside something else.

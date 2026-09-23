@@ -7,10 +7,14 @@ network calls and zero live LLM tokens: the model side is MockModelProvider.
 """
 
 import io
+import subprocess
 import sys
+import time
+
+import pytest
 
 from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
-from ftw.repl.cli import build_repl_session
+from ftw.repl.cli import WorkerStartupError, _enable_readline, _wait_for_worker_or_crash, build_repl_session
 
 
 class ScriptedInput:
@@ -38,6 +42,46 @@ def assistant_run_command() -> ProviderResponse:
 
 def assistant_text(text: str) -> ProviderResponse:
     return ProviderResponse(message=ChatMessage(role=ChatRole.ASSISTANT, content=text))
+
+
+class TestEnableReadline:
+    def test_returns_true_when_readline_is_importable(self):
+        # readline is stdlib on this (Linux) test environment.
+        assert _enable_readline() is True
+
+    def test_returns_false_without_raising_when_unavailable(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "readline":
+                raise ImportError("no module named readline")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        assert _enable_readline() is False  # must not raise, e.g. on Windows
+
+
+class TestWaitForWorkerOrCrash:
+    def test_returns_quietly_when_the_process_stays_alive(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+        try:
+            _wait_for_worker_or_crash(proc, grace_s=0.2)  # must not raise
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_raises_promptly_when_the_process_exits_early(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])
+        start = time.monotonic()
+        try:
+            with pytest.raises(WorkerStartupError, match="3"):
+                _wait_for_worker_or_crash(proc, grace_s=5.0)
+        finally:
+            proc.wait(timeout=5)
+        assert time.monotonic() - start < 2.0  # detected the crash, didn't wait out the full grace period
 
 
 class TestBuildReplSessionWithRealWorker:

@@ -33,17 +33,50 @@ from ftw.workbench import ContextWorkbench
 
 DEFAULT_SYSTEM_ANCHOR = "You are FTW, a local-first agent. Be terse and safe."
 
-# Pragmatic Phase 1 startup grace: enough for a `python -m` subprocess to
-# import and bind its socket before the first real call. A proper
-# readiness handshake (rather than a fixed sleep) is future work — see
-# ftw_plan.md §4 "Service Discovery & Supervision".
+# Grace period for the shell-worker subprocess to start. NNG's own dial
+# retries transparently in the background (see bus.py), so this isn't
+# needed for correctness — a slow-starting worker just adds latency to the
+# first real command. What it's actually for is catching a worker that
+# never comes up at all (bad import, bind failure, ...): rather than sleep
+# through this window blind, _wait_for_worker_or_crash polls the process
+# and fails fast and loud the moment it exits, instead of leaving the
+# caller to hit a bare deadline_exceeded on its first real command. A full
+# readiness handshake over a control channel (ftw_plan.md §4 "Service
+# Discovery & Supervision") would let this return early on success too;
+# that's future work.
 DEFAULT_WORKER_STARTUP_GRACE_S = 0.5
+_WORKER_POLL_INTERVAL_S = 0.02
+
+
+class WorkerStartupError(Exception):
+    pass
 
 
 def spawn_shell_worker(address: str, output_root: Path) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, "-m", "ftw.tools.shell", "--address", address, "--output-root", str(output_root)],
     )
+
+
+def _wait_for_worker_or_crash(proc: subprocess.Popen, *, grace_s: float) -> None:
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise WorkerStartupError(
+                f"shell worker exited during startup (exit code {proc.returncode}); see its output above"
+            )
+        time.sleep(_WORKER_POLL_INTERVAL_S)
+
+
+def _enable_readline() -> bool:
+    """Enables arrow-key history and line editing on the real interactive
+    prompt — stdlib on POSIX, not present on Windows, best-effort either
+    way since it's a pure usability nicety."""
+    try:
+        import readline  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 @dataclass
@@ -88,7 +121,7 @@ def build_repl_session(
 
     worker_address = worker_address or ipc_address(f"worker.tool.shell.{uuid4().hex[:8]}")
     worker_proc = spawn_shell_worker(worker_address, output_root)
-    time.sleep(worker_startup_grace_s)
+    _wait_for_worker_or_crash(worker_proc, grace_s=worker_startup_grace_s)
     requester = Requester(worker_address)
 
     trace_writer = TraceWriter(traces_root)
@@ -154,6 +187,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--tier", default="fast")
     parser.add_argument("--ftw-home", default=str(Path.home() / ".ftw"))
     parser.add_argument("--skills-dir", default=None, help="defaults to <ftw-home>/skills")
+    _enable_readline()
     _run_repl(parser.parse_args(argv))
 
 
