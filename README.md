@@ -1,27 +1,13 @@
 # FTW — Framed Task Workers
 
 A personal, local-first agent framework. FTW talks to a model over an
-async **NNG message bus**, keeps its own context in an inspectable,
-budgeted **Context Workbench** instead of one ever-growing prompt, and lets
-you **mount and unmount skills** into that context on demand — multiple at
-once, nested, freed again the moment you're done with them — so a long
-session never has to mean a bloated one.
+async **NNG message bus**, keeps its context in an inspectable, budgeted
+**Context Workbench** instead of one ever-growing prompt, and lets you
+**mount and unmount skills** into that context on demand — multiple at
+once, nested, freed the moment you're done with them.
 
-See [`ftw_plan.md`](ftw_plan.md) for the full design and roadmap, and
+See [`ftw_plan.md`](ftw_plan.md) for the full design, and
 [`CLAUDE.md`](CLAUDE.md) for the project's working conventions.
-
-## Status
-
-- **Phase 0** — envelope protocol, NNG bus (Req/Rep with contexts, Pub/Sub),
-  runtime directory handling. Done.
-- **Phase 1** — model providers, the Context Workbench, the agent loop,
-  the shell tool worker, a minimal confirm-every-command interceptor, the
-  REPL, live event tap, durable tracing. Done.
-- **Phase 2** (next) — skills and mounted frames: `/mount`, `/unmount`,
-  nested and simultaneous mounts, self-mounting by the model.
-
-155 tests, TDD throughout, no network calls or live model tokens in the
-test suite.
 
 ## Quickstart
 
@@ -40,20 +26,59 @@ export DEEPSEEK_API_KEY=...   # or NOUS_API_KEY
 ```
 
 ```bash
-uv run ftw          # start the REPL
-uv run ftw tap       # in another terminal: stream live events from a running session
+uv run ftw                                    # start the REPL
+uv run ftw --skills-dir examples/skills       # ...with two ready-to-mount example skills
+uv run ftw tap                                # in another terminal: stream live events from a running session
 ```
 
-In the REPL: `/context` shows the current token budget by zone, `/clear`
-resets the turn history, `/exit` quits. Shell commands the model proposes
-are confirmed with you before they run.
+## The REPL
+
+| Command | Does |
+| :--- | :--- |
+| `/context` | Shows the current token budget, zone by zone. |
+| `/clear` | Resets the turn history. |
+| `/mount [--pin] <skill>` | Mounts a skill; `--pin` stops the model from unmounting it. |
+| `/unmount [skill]` | Unmounts a skill (or, with no name, whichever is focused), distilling its work into a milestone. |
+| `/focus [skill]` | Switches which mounted skill new turns and mounts attach to; no argument returns focus to the root session. |
+| `/frames` | Shows the mounted-skill tree. |
+| `/exit` | Quits. |
+
+The model can also find, mount, and unmount skills itself (`find_skill`,
+`mount_skill`, `unmount_skill`), and manages its own scratchpad
+(`pin`/`unpin`) and tool-output handles (`read_output`/`grep_output`) —
+all without your involvement unless you step in with the commands above.
+Shell commands the model proposes are confirmed with you before they run.
+
+## Skills
+
+A skill is a directory containing a `SKILL.md`: YAML frontmatter (name,
+description, and other metadata) followed by a Markdown body — the
+procedure that gets injected into context once mounted. Bodies are capped
+at 1,500 tokens; a skill that outgrows that needs to be split.
+
+```yaml
+---
+name: cmake.diagnose_configure
+description: Diagnose failing CMake configuration and isolate root causes with evidence.
+kind: prompt
+---
+
+Reproduce the failure, grep the error log, report cause and fix.
+```
+
+Point `--skills-dir` at a directory of these (default `<ftw-home>/skills`)
+and the model can find and mount them by name or by searching. Two
+examples live in [`examples/skills`](examples/skills).
 
 ## Development
 
 ```bash
-uv run pytest                        # full suite, ~2.5s
+uv run pytest                        # full suite, a few seconds
 uv run scripts/export_schemas.py     # regenerate schemas/*.schema.json after touching protocol.py
 ```
+
+TDD throughout: no network calls or live model tokens anywhere in the test
+suite.
 
 ## Project layout
 
@@ -64,6 +89,8 @@ src/ftw/
 ├── runtime.py             runtime directory + inproc/ipc address resolution
 ├── tokens.py              the canonical, provider-independent token counter
 ├── workbench.py           the Context Workbench: budgeted zones, prompt rendering
+├── frames.py              the mounted-skill frame tree: nesting, focus, subtree eviction, milestones
+├── skills/                SKILL.md parsing, the size lint, and the skill store (find_skill via BM25)
 ├── outputs.py             out-of-band tool-output store (read_output/grep_output handles)
 ├── agent_loop.py          model -> interceptor -> bus -> result cycle
 ├── intercept/             Pre-Commit Interceptor pipeline
@@ -74,8 +101,9 @@ src/ftw/
 ├── config.py              ftw.toml loading and provider/tier resolution
 └── repl/                  the REPL loop (session.py) and its CLI wiring (cli.py)
 
-tests/      one test file per module above, plus test_repl_flow.py, test_repl_cli.py
-schemas/    generated JSON Schemas for polyglot (non-Python) workers
+tests/             one test file per module above
+examples/skills/   a couple of skills ready to mount
+schemas/           generated JSON Schemas for polyglot (non-Python) workers
 ```
 
 ## License
