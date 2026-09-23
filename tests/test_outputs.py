@@ -10,6 +10,60 @@ import pytest
 from ftw.outputs import OutputNotFound, OutputStore, build_excerpt
 
 
+class TestPathTraversal:
+    """output_id (and trace_id) can reach here from model tool-call
+    arguments (read_output/grep_output, agent_loop.py's local tools,
+    never pass through the interceptor). An absolute path or a `..`
+    segment must never let a read escape the store root — Path("/root")
+    / "/etc/hostname" silently evaluates to "/etc/hostname" in Python,
+    so naive concatenation is a real path-traversal hole, not a
+    theoretical one."""
+
+    def test_absolute_output_id_cannot_read_outside_the_root(self, tmp_path):
+        secret = tmp_path.parent / "secret-outside-root.txt"
+        secret.write_text("top secret")
+        store = OutputStore(tmp_path / "store")
+
+        with pytest.raises(OutputNotFound):
+            store.read("trace-1", str(secret))
+
+    def test_dotdot_output_id_cannot_escape_the_root(self, tmp_path):
+        # store root is tmp_path/store; two ".." segments from
+        # <root>/trace-1/ reach tmp_path itself, where this file lives.
+        # POSIX only resolves ".." through a directory that actually
+        # exists, so trace-1/ has to be real first (an ordinary save()
+        # does that) for this to be a meaningful test of the traversal
+        # itself rather than an accidental "no such directory".
+        secret = tmp_path / "secret-outside-store.txt"
+        secret.write_text("top secret")
+        store = OutputStore(tmp_path / "store")
+        store.save("trace-1", "ordinary content")
+
+        with pytest.raises(OutputNotFound):
+            store.read("trace-1", "../../secret-outside-store.txt")
+
+    def test_absolute_trace_id_cannot_read_outside_the_root(self, tmp_path):
+        secret = tmp_path.parent / "secret2.txt"
+        secret.write_text("top secret")
+        store = OutputStore(tmp_path / "store")
+
+        with pytest.raises(OutputNotFound):
+            store.read(str(tmp_path.parent), "secret2.txt")
+
+    def test_grep_is_also_protected(self, tmp_path):
+        secret = tmp_path.parent / "secret3.txt"
+        secret.write_text("password=hunter2")
+        store = OutputStore(tmp_path / "store")
+
+        with pytest.raises(OutputNotFound):
+            store.grep("trace-1", str(secret), "password")
+
+    def test_ordinary_generated_ids_still_work(self, tmp_path):
+        store = OutputStore(tmp_path / "store")
+        output_id = store.save("trace-1", "hello")
+        assert store.read("trace-1", output_id) == "hello"
+
+
 class TestSaveAndRead:
     def test_round_trips_full_content(self, tmp_path):
         store = OutputStore(tmp_path)

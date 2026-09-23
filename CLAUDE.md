@@ -19,8 +19,18 @@ suspends and relays back through the caller to a real human instead of
 blocking (`AgentLoop.resume_delegated`, `DelegatedSuspension`), and
 `CANCEL` on a separate control channel (`<address>.ctl`) cooperatively
 aborts an in-flight run between steps — all fully built and tested via the
-control channel directly. Phase 4 (interceptor policy beyond "confirm
-every shell command", deterministic verifiers) is next. See §8 of
+control channel directly. A follow-up hardening pass (post-Phase-3, driven
+by an external review) fixed a path-traversal hole in `outputs.py`, made
+`bus.Replier` turn a handler exception into an `ErrorEnvelope` instead of
+killing the worker thread, made `AgentLoop` catch `ProviderError` and
+`DeadlineExceeded` gracefully instead of crashing the turn, gave every
+dispatched `CALL` a deadline longer than whatever it wraps
+(`DEFAULT_CALL_DEADLINES_MS`), fixed `ftw tap`'s default address to
+actually match the REPL's, and switched turn/pin frame-tagging from
+per-turn to per-message (`ContextWorkbench.add_tagged_turn`) so the
+mount/unmount invariant below holds even when a model mounts, works, and
+unmounts within a single reply. Phase 4 (interceptor policy beyond
+"confirm every shell command", deterministic verifiers) is next. See §8 of
 `ftw_plan.md` for the phase list.
 
 **Known gap:** Ctrl-C does not reliably trigger that CANCEL. Confirmed
@@ -32,7 +42,19 @@ retry loop was tried and reverted: retrying `recv()` on the same `Req0`
 socket after a timeout hits a separate pynng bug (`BadState`). A real fix
 needs resend- and idempotency-key-based retry in `bus.Requester.call()`
 (`resend_time` is disabled outright today, for the correctness reasons in
-that class's own docstring) — real, separate work, not a quick patch.
+that class's own docstring) — real, separate work, not a quick patch. If a
+`KeyboardInterrupt` or a `DeadlineExceeded` *does* land (e.g. a dispatch
+that was already returning), `AgentLoop` now reports it as a normal tool
+result instead of crashing the turn — but the underlying "Ctrl-C usually
+doesn't get a chance to land at all" problem above is unchanged.
+
+**Known gap:** `idempotency_key` (`protocol.py`, `bus.py`'s
+`_IdempotencyCache`) is real, tested dedupe plumbing, but nothing in this
+codebase sets it on an outgoing `CallEnvelope` yet — no caller actually
+retries a call today, so the dedupe path is exercised only by tests that
+construct the key by hand. Treat "workers dedupe on idempotency_key" below
+as a capability, not a claim that it's protecting anything in production
+yet.
 
 Run it: `uv run ftw` (needs a real key for the `fast`/`smart` tiers in
 `ftw.toml` — `DEEPSEEK_API_KEY` / `NOUS_API_KEY`). Point `--skills-dir` at

@@ -179,6 +179,15 @@ class Replier:
             stale_path.unlink()
             return pynng.Rep0(listen=address, recv_timeout=recv_timeout_ms)
 
+    @staticmethod
+    def _error_reply(envelope: AnyEnvelope, exc: Exception) -> ErrorEnvelope:
+        return ErrorEnvelope(
+            source=envelope.target,
+            target=envelope.source,
+            trace_id=envelope.trace_id,
+            payload=ErrorPayload(code="handler_error", message=f"{type(exc).__name__}: {exc}"),
+        )
+
     def _handle(self, envelope: AnyEnvelope, handler: Handler) -> bytes:
         key = envelope.idempotency_key
         if key is None:
@@ -199,7 +208,17 @@ class Replier:
                     envelope = parse_envelope(raw)
                 except ValidationError:
                     continue  # malformed on the wire; drop rather than crash the worker
-                reply_bytes = self._handle(envelope, handler)
+                try:
+                    reply_bytes = self._handle(envelope, handler)
+                except Exception as exc:
+                    # A handler bug (or an upstream failure it didn't catch
+                    # — a ProviderError, a UnicodeDecodeError on binary
+                    # subprocess output, ...) must not take this whole
+                    # worker thread down with it: that's num_workers
+                    # concurrent slots reduced by one, permanently, for
+                    # the life of the process. Reply with an error instead
+                    # and keep serving.
+                    reply_bytes = dump_envelope(self._error_reply(envelope, exc))
                 try:
                     ctx.send(reply_bytes)
                 except pynng.exceptions.Closed:

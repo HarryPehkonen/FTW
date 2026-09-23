@@ -209,7 +209,7 @@ Rather than allowing conversation history to accumulate until truncation mechani
 | **User Memory** | ~500 tokens | Permanent | Standing user preferences, active host constraints. |
 | **Mounted Skill** | 0 to 3,000 tokens (≤ 1,500 per skill) | Ephemeral (per frame) | Active skill instructions and tool declarations for every mounted frame (0 when none mounted). |
 | **Milestones** | ~150 tokens | Rolling | Distilled summaries of the last N unmounted frames. |
-| **Turn Horizon** | 2,000–4,000 tokens | Rolling FIFO | The last 2–4 conversational turns, each tagged with its frame. Flushed to episodic traces when aged out. |
+| **Turn Horizon** | 2,000–4,000 tokens | Rolling FIFO | The last 2–4 conversational turns, each tagged with its frame. `ContextWorkbench` takes an `on_turn_evicted` callback for flushing aged-out turns to episodic traces; nothing wires it up yet (aspirational — future work). |
 | **Scratchpad / Pinboard** | ~300 tokens | Dynamic | Mutable working state (e.g., target repo path, current error, active target), written by the model via `pin(key, value)` / `unpin(key)`. Pins are frame-tagged. |
 
 **Zone order is the prompt order**, arranged for prefix/KV-cache reuse (llama.cpp, vLLM, and API prompt caching): least-volatile first, most-volatile last. Mounting or unmounting only invalidates the cache from the Mounted Skill Zone onward.
@@ -218,8 +218,8 @@ Rather than allowing conversation history to accumulate until truncation mechani
 Raw tool output never enters the prompt wholesale. Each result is stored out of band (`$FTW_HOME/outputs/<trace_id>/<id>`), and the Turn Horizon gets a bounded excerpt (head/tail plus exit code) and a handle. The model reads more with `read_output(id, start, end)` or `grep_output(id, pattern)`. Otherwise one build log undoes everything unmounting frees.
 
 #### Token Counting
-- **Budgets** use the active provider's counter where one is available, otherwise an estimate.
-- **The skill size lint** (1,500 tokens) uses one fixed, canonical counter so a skill's validity doesn't depend on which model is active.
+- **Budgets** (every workbench zone, not just the skill-size lint) always use one fixed, canonical estimate (`ftw.tokens.count_tokens`) — never a model-specific counter, so a skill's validity or whether a mount fits its budget never depends on which provider happens to be active. A per-provider counter, layered on top as a display refinement without becoming the source of truth for an enforced budget, is aspirational — not implemented today.
+- **The skill size lint** (1,500 tokens) uses that same fixed, canonical counter, for the same reason.
 - A skill's tool declarations count toward its Mounted Skill budget.
 
 #### Visual Context Audit (`/context`)

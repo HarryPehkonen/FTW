@@ -88,7 +88,7 @@ class TestWaitForWorkerOrCrash:
 
 
 class TestBuildReplSessionWithRealWorker:
-    def test_shell_command_round_trips_through_a_real_subprocess_worker(self, tmp_path):
+    def test_shell_command_round_trips_through_a_real_subprocess_worker(self, isolated_runtime_dir, tmp_path):
         provider = MockModelProvider([assistant_run_command(), assistant_text("it printed the line")])
         out = io.StringIO()
 
@@ -104,6 +104,30 @@ class TestBuildReplSessionWithRealWorker:
             handle.close()
 
         assert reply == "it printed the line"
+
+    def test_default_events_address_matches_what_ftw_tap_dials_by_default(self, isolated_runtime_dir, tmp_path):
+        """ftw tap's own default (--address, observability/tap.py) has to
+        be the same address the REPL actually publishes on with no
+        override — otherwise `uv run ftw tap` silently receives nothing
+        against a real running session, which it did before this fix."""
+        from ftw.bus import Subscriber
+        from ftw.runtime import ipc_address
+
+        provider = MockModelProvider([assistant_text("hello")])
+        handle = build_repl_session(
+            ftw_home=tmp_path,
+            provider=provider,
+            input_fn=ScriptedInput([]),
+            output=io.StringIO(),
+        )
+        try:
+            with Subscriber(ipc_address("events"), topics=[""]) as sub:  # exactly tap.py's own default
+                time.sleep(0.05)  # let the subscription establish
+                handle.session.agent_loop.run_turn("hi")
+                received = sub.recv(timeout_ms=2000)
+            assert received.payload.topic.startswith("event.")
+        finally:
+            handle.close()
 
 
 def write_skill(root, relpath: str, name: str, description: str, body: str = "do the thing") -> None:
@@ -133,7 +157,7 @@ class TestPhase2Deliverable:
     two more completions, child-then-parent, fired from inside the
     unmount_skill tool call itself, before the turn's final answer)."""
 
-    def test_find_mount_nested_mount_run_shell_then_unmount_restores_baseline(self, tmp_path):
+    def test_find_mount_nested_mount_run_shell_then_unmount_restores_baseline(self, isolated_runtime_dir, tmp_path):
         skills_dir = tmp_path / "skills"
         write_skill(skills_dir, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose failing CMake configuration.")
         write_skill(skills_dir, "toolchain/verify_installed", "toolchain.verify_installed", "Verify a compiler toolchain.")
@@ -180,10 +204,27 @@ class TestPhase2Deliverable:
         assert workbench.mounted_skill_tokens == 0  # the whole subtree was evicted
         assert len(workbench.milestones) == 1  # one combined milestone, child folded into parent
         assert workbench.milestones[0] == "cmake.diagnose_configure: root cause identified. [toolchain.verify_installed: gcc found on PATH.]"
-        # turn 1 (tagged to the mounted frame) was evicted; turn 2 (committed after
-        # the unmount, with nothing focused) remains, untagged, at the root
-        assert len(workbench.turns) == 1
-        assert workbench.turns[0][-1].content == "all done"
+        # Per-message tagging (not per-turn): only the messages actually
+        # produced while cmake/toolchain had focus were evicted. Turn 1's
+        # opening exchange ("diagnose my cmake failure", finding the
+        # skill, deciding to mount it) happened *before* the mount took
+        # effect, so it correctly survives — unlike the old per-turn
+        # tagging, which tagged (and so destroyed) the whole turn based on
+        # whatever was focused only once the turn finished. The mounted
+        # work itself (both mount results, the confirmed shell command,
+        # the "mounted..." reply) is gone.
+        assert len(workbench.turns) == 2
+        turn1_contents = [m.content for m in workbench.turns[0]]
+        assert turn1_contents[0] == "diagnose my cmake failure"
+        assert "mounted cmake help and confirmed gcc is on PATH" not in turn1_contents
+        assert not any(isinstance(c, str) and "gcc found" in c for c in turn1_contents)
+        # Turn 2 (mount -> unmount all within one reply, the model's
+        # natural self-mount pattern) wasn't committed to the workbench
+        # until *after* its own unmount already ran, so evict_frame()
+        # never had a chance to reach into it — it survives whole. This
+        # is expected: eviction only ever acts on already-committed
+        # history, never on the turn still being built.
+        assert workbench.turns[1][-1].content == "all done"
 
         snapshot = workbench.snapshot()
         by_name = {z.name: z for z in snapshot.zones}
@@ -248,7 +289,7 @@ class TestDelegatedSkillRealSubprocess:
     other Phase 3 tests can't cross, since MockModelProvider can't be
     handed to a separate process."""
 
-    def test_delegate_skill_across_a_real_subprocess_boundary(self, tmp_path):
+    def test_delegate_skill_across_a_real_subprocess_boundary(self, isolated_runtime_dir, tmp_path):
         skills_dir = tmp_path / "skills"
         write_skill(skills_dir, "toolchain/verify_installed", "toolchain.verify_installed", "Verify a compiler toolchain is installed.")
 
@@ -299,7 +340,7 @@ class TestDelegatedSkillRealSubprocess:
         assert len(tool_messages) == 1
         assert "gcc 13 is installed" in tool_messages[0].content
 
-    def test_delegated_run_asking_for_confirmation_is_relayed_across_the_real_subprocess_boundary(self, tmp_path):
+    def test_delegated_run_asking_for_confirmation_is_relayed_across_the_real_subprocess_boundary(self, isolated_runtime_dir, tmp_path):
         """The skill-runner subprocess's own interceptor asks for
         confirmation before running a shell command; that ASK crosses back
         to this process, gets answered here (scripted 'y'), and the answer
@@ -361,7 +402,7 @@ class TestCancelRealSubprocess:
     subprocess — not just exercised in-process against the worker object
     directly, the way test_skills_runner.py's TestCancel does."""
 
-    def test_cancel_over_the_real_control_channel_aborts_a_real_subprocess_run(self, tmp_path):
+    def test_cancel_over_the_real_control_channel_aborts_a_real_subprocess_run(self, isolated_runtime_dir, tmp_path):
         skills_dir = tmp_path / "skills"
         write_skill(skills_dir, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose CMake.")
 

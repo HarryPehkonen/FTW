@@ -162,6 +162,59 @@ class TestSingleFrameInvariant:
         assert "cmake.diagnose_configure" in milestone
         assert "run_command" in milestone
 
+    def test_invariant_holds_with_a_non_empty_baseline_before_the_mount(self, tree, workbench):
+        """The earlier version of this class only ever mounted into a
+        workbench that started completely empty — "baseline" was
+        vacuously []. Real sessions already have turns, pins, and
+        milestones from before a skill is ever mounted; the invariant has
+        to hold relative to whatever that baseline actually was, not just
+        for the empty case."""
+        workbench.add_turn([user("earlier, unrelated question")])
+        workbench.pin("repo", "/home/user/src/core")
+        workbench.add_milestone("an earlier, unrelated milestone")
+        before_turns = list(workbench.turns)
+        before_scratchpad = dict(workbench.scratchpad)
+        before_milestones = list(workbench.milestones)
+
+        frame = tree.mount("cmake.diagnose_configure", owner="user")
+        workbench.add_turn([user("diagnose it"), assistant_with_tool("run_command")], frame_id=frame.id)
+        workbench.pin("finding", "missing openssl", frame_id=frame.id)
+
+        milestone = tree.unmount("cmake.diagnose_configure", by="user")
+
+        assert workbench.mounted_skill_tokens == 0
+        assert workbench.turns == before_turns  # the baseline turn is untouched, in its original position
+        assert workbench.scratchpad == before_scratchpad  # the baseline pin survives; only the frame's own pin is gone
+        assert workbench.milestones == before_milestones + [milestone]  # baseline milestone kept, exactly one new one
+        assert tree.focused_skill_name is None
+
+    def test_invariant_holds_when_baseline_turns_were_already_evicted_by_ordinary_fifo_pressure(self, store):
+        """A tight turn_horizon_budget can evict a baseline (unrelated)
+        turn via ordinary FIFO pressure while a frame is mounted and
+        working — nothing to do with the frame itself. unmount()'s own
+        eviction must not get confused by that: it should remove exactly
+        the frame's own surviving tagged content and nothing else, leaving
+        whatever ordinary FIFO eviction already did alone."""
+        workbench = ContextWorkbench(system_anchor="anchor", turn_horizon_budget=12)
+        tree = FrameTree(workbench, store)
+
+        workbench.add_turn([user("one two three four five")])  # baseline turn 1: 5 tokens
+        workbench.add_turn([user("six seven eight nine ten")])  # baseline turn 2: 5 tokens
+
+        frame = tree.mount("cmake.diagnose_configure", owner="user")
+        workbench.add_turn([user("eleven twelve thirteen")], frame_id=frame.id)  # 3 tokens; 5+5+3=13 > 12
+
+        # sanity: ordinary FIFO pressure, unrelated to the frame, already
+        # evicted the oldest (baseline) turn before unmount ever runs
+        assert workbench.turns == [[user("six seven eight nine ten")], [user("eleven twelve thirteen")]]
+
+        milestone = tree.unmount("cmake.diagnose_configure", by="user")
+
+        assert workbench.mounted_skill_tokens == 0
+        assert workbench.turns == [[user("six seven eight nine ten")]]  # only the FIFO-surviving baseline turn remains
+        assert workbench.milestones == [milestone]
+        assert tree.focused_skill_name is None
+
 
 class TestSiblingFrames:
     def test_unmounting_one_sibling_leaves_the_other_intact(self, tree, workbench):

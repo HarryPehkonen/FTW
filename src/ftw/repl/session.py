@@ -15,39 +15,23 @@ from typing import Any, Callable, TextIO
 
 from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameError
-from ftw.protocol import AskEnvelope, CallEnvelope
+from ftw.protocol import AskEnvelope
 from ftw.skills.registry import SkillNotFound
 
 InputFn = Callable[[str], str]
 
 
-def make_confirm(input_fn: InputFn, output: TextIO) -> Callable[[CallEnvelope], bool]:
-    """Builds a Pre-Commit Interceptor ``confirm`` callback that asks the
-    human over the given input/output — the same channel the REPL prompt
-    itself uses. Fails closed (declines) on EOF, exactly like the
-    AgentLoop's own default."""
-
-    def confirm(call: CallEnvelope) -> bool:
-        print(f"Confirm {call.payload.action} {call.payload.args}? [y/N] ", end="", file=output)
-        try:
-            answer = input_fn("")
-        except EOFError:
-            print("(EOF — declining)", file=output)
-            return False
-        return answer.strip().lower() in ("y", "yes")
-
-    return confirm
-
-
 def make_ask_answerer(input_fn: InputFn, output: TextIO) -> Callable[[AskEnvelope], Any]:
-    """Builds an AgentLoop ``ask_answerer`` callback: answers a
-    worker-initiated ASK (ftw_plan.md §4 "Mid-call interaction") over the
-    same input/output the REPL prompt uses. A delegated run's own
-    interceptor ASK surfaces to the REPL exactly this way too — this is
-    what makes it answerable at all. Yes/no reads as a bool (matching the
-    common "confirm this action" case); anything else is passed through
-    as free text, for a worker asking something other than yes/no. Fails
-    closed on EOF, same as make_confirm."""
+    """Builds an AgentLoop ``ask_answerer`` callback: the one thing that
+    answers ANY question AgentLoop asks — the interceptor's own ASK
+    (question now includes the actual action and arguments, not just its
+    reason) and a worker-initiated ASK (ftw_plan.md §4 "Mid-call
+    interaction") alike, over the same input/output the REPL prompt uses.
+    A delegated run's own interceptor ASK surfaces to the REPL exactly
+    this way too — this is what makes it answerable at all. Yes/no reads
+    as a bool (only an answer of exactly True ever allows an intercepted
+    call through); anything else is passed through as free text, for a
+    worker asking something other than yes/no. Fails closed on EOF."""
 
     def answerer(ask: AskEnvelope) -> Any:
         print(f"{ask.payload.question} ", end="", file=output)

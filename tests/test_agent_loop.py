@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import pytest
 
 from ftw.agent_loop import AgentLoop, DelegatedSuspension
+from ftw.bus import DeadlineExceeded
 from ftw.frames import FrameTree
 from ftw.intercept import ConfirmShellCommands, InterceptDecision, InterceptOutcome, PreCommitInterceptor
 from ftw.outputs import OutputStore
@@ -25,7 +26,7 @@ from ftw.protocol import (
     ResultEnvelope,
     ResultPayload,
 )
-from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
+from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderError, ProviderResponse, ToolCall
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
 
@@ -67,7 +68,7 @@ def make_loop(
     responses,
     dispatch=None,
     interceptor=None,
-    confirm=None,
+    ask_answerer=None,
     max_steps=15,
     output_root,
     on_event=None,
@@ -78,7 +79,7 @@ def make_loop(
         output_store=OutputStore(output_root),
         dispatch=dispatch or (lambda call: (_ for _ in ()).throw(AssertionError("dispatch should not be called"))),
         interceptor=interceptor or PreCommitInterceptor([]),
-        confirm=confirm,
+        ask_answerer=ask_answerer,
         max_steps=max_steps,
         on_event=on_event,
     )
@@ -167,7 +168,7 @@ class TestConfirmation:
             ],
             dispatch=dispatcher,
             interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
-            confirm=lambda call: True,
+            ask_answerer=lambda ask: True,
             output_root=tmp_path,
         )
 
@@ -184,7 +185,7 @@ class TestConfirmation:
             ],
             dispatch=None,
             interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
-            confirm=lambda call: False,
+            ask_answerer=lambda ask: False,
             output_root=tmp_path,
         )
 
@@ -192,9 +193,9 @@ class TestConfirmation:
 
         assert result == "ok, not running that"
 
-    def test_default_confirm_denies(self, tmp_path):
-        """No confirm callback wired up (e.g. non-interactive) must fail
-        closed, never silently allow a shell command through."""
+    def test_default_ask_answerer_denies(self, tmp_path):
+        """No ask_answerer callback wired up (e.g. non-interactive) must
+        fail closed, never silently allow a shell command through."""
         loop = AgentLoop(
             workbench=ContextWorkbench(),
             provider=MockModelProvider(
@@ -206,12 +207,12 @@ class TestConfirmation:
         )
         assert loop.run_turn("do it") == "skipped"
 
-    def test_block_decision_never_calls_confirm_or_dispatch(self, tmp_path):
+    def test_block_decision_never_calls_ask_answerer_or_dispatch(self, tmp_path):
         class AlwaysBlock:
             def evaluate(self, call):
                 return InterceptOutcome(InterceptDecision.BLOCK, reason="path outside sandbox")
 
-        confirm_calls = []
+        answerer_calls = []
         loop = make_loop(
             responses=[
                 assistant_tool_call("run_command", {"argv": ["rm", "-rf", "/"]}),
@@ -219,14 +220,14 @@ class TestConfirmation:
             ],
             dispatch=None,
             interceptor=PreCommitInterceptor([AlwaysBlock()]),
-            confirm=lambda call: confirm_calls.append(call) or True,
+            ask_answerer=lambda ask: answerer_calls.append(ask) or True,
             output_root=tmp_path,
         )
 
         result = loop.run_turn("delete everything")
 
         assert result == "blocked"
-        assert confirm_calls == []
+        assert answerer_calls == []
 
 
 class TestUnknownTool:
@@ -424,7 +425,7 @@ class TestFrameToolsIntegration:
     "Self-Mounting"): local execution (no bus dispatch) but still routed
     through the interceptor, unlike pin/unpin/read_output/grep_output."""
 
-    def make_loop_with_frames(self, tmp_path, responses, *, interceptor=None, confirm=None):
+    def make_loop_with_frames(self, tmp_path, responses, *, interceptor=None, ask_answerer=None):
         write_skill(tmp_path, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose failing CMake configuration.")
         store = SkillStore(tmp_path)
         workbench = ContextWorkbench()
@@ -435,7 +436,7 @@ class TestFrameToolsIntegration:
             output_store=OutputStore(tmp_path / "outputs"),
             dispatch=lambda call: (_ for _ in ()).throw(AssertionError("must not dispatch")),
             interceptor=interceptor or PreCommitInterceptor([]),
-            confirm=confirm,
+            ask_answerer=ask_answerer,
             frame_tree=tree,
         )
         return loop, tree
@@ -542,6 +543,43 @@ class TestFrameToolsIntegration:
         loop.run_turn("hello")
         assert loop.workbench.evict_frame("anything") == []  # nothing was tagged to any frame
         assert len(loop.workbench.turns) == 1  # the turn is still there, just untagged
+
+    def test_mount_work_and_unmount_within_a_single_turn_leaves_nothing_behind(self, tmp_path):
+        """The model's natural self-mount pattern: mount, do the work, and
+        unmount all as tool calls within ONE reply — committed as a single
+        turn. Per-turn tagging used to tag the whole turn with whatever was
+        focused at commit time (i.e. nothing, since the unmount already
+        ran) — so evict_frame found nothing to evict and the mounted
+        skill's own conversation content leaked into the horizon forever.
+        Per-message tagging fixes this: each message is tagged with focus
+        as of when it was produced, so the frame's own messages are still
+        findable and removable even though the frame was long since
+        unfocused by the time the turn committed."""
+        loop, tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}, call_id="c1"),
+                assistant_tool_call("unmount_skill", {"name": "cmake.diagnose_configure"}, call_id="c2"),
+                assistant_text("mounted, worked, and unmounted, all in one go"),
+            ],
+        )
+        result = loop.run_turn("diagnose the cmake failure end to end")
+
+        assert result == "mounted, worked, and unmounted, all in one go"
+        assert tree.focused_skill_name is None
+        # the invariant that actually matters here: the mounted skill's own
+        # (potentially ~1500-token) body text is fully freed and exactly
+        # one milestone was produced — mount/unmount both happening inside
+        # this same not-yet-committed turn means evict_frame() (which acts
+        # on already-committed history) has nothing of *this* turn's own
+        # tool-call transcript to remove, and that's fine: those few lines
+        # ("mounted ...", "unmounted; milestone: ...") are small, ordinary
+        # conversational content, not the frame's bulk skill text.
+        assert loop.workbench.mounted_skill_tokens == 0
+        assert len(loop.workbench.milestones) == 1
+        assert len(loop.workbench.turns) == 1
+        tool_names_in_turn = [m.name for m in loop.workbench.turns[0] if m.role == ChatRole.TOOL]
+        assert tool_names_in_turn == ["mount_skill", "unmount_skill"]
 
     def test_agent_loop_without_frame_tree_reports_frame_tools_as_unknown(self, tmp_path):
         loop = AgentLoop(
@@ -972,3 +1010,198 @@ class TestWorkerInitiatedAskRelay:
         )
         assert loop.run_turn("go") == "gave up"
         assert len(dispatcher.calls) < 50  # bailed out well before exhausting the script
+
+
+class TestAnswerMustBeExactlyTrue:
+    """A free-text answer to an interceptor ASK ("nope", "cancel", any
+    non-empty string) must decline, not approve. bool("nope") is True in
+    Python — coercing through bool() would have silently approved a
+    command someone was trying to decline."""
+
+    def test_free_text_declines_rather_than_approves(self, tmp_path):
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["rm", "-rf", "/"]}), assistant_text("didn't run it")],
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+            ask_answerer=lambda ask: "nope",  # someone trying to decline in words, not "y"/"n"
+            output_root=tmp_path,
+        )
+        assert loop.run_turn("delete everything") == "didn't run it"
+
+    def test_the_string_false_also_declines(self, tmp_path):
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["rm", "-rf", "/"]}), assistant_text("didn't run it")],
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+            ask_answerer=lambda ask: "False",  # a non-empty string is truthy in Python; must not be treated as approval
+            output_root=tmp_path,
+        )
+        assert loop.run_turn("delete everything") == "didn't run it"
+
+    def test_exactly_true_still_approves(self, tmp_path):
+        dispatcher = RecordingDispatcher(
+            [ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0"))]
+        )
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["ls"]}), assistant_text("listed")],
+            dispatch=dispatcher,
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+            ask_answerer=lambda ask: True,
+            output_root=tmp_path,
+        )
+        assert loop.run_turn("list files") == "listed"
+        assert len(dispatcher.calls) == 1
+
+
+class TestAskShowsTheActualCall:
+    """The relayed question must show what's actually being approved —
+    not just the interceptor's generic reason — so a human isn't asked to
+    approve blind."""
+
+    def test_ask_question_includes_the_tool_name_and_arguments(self, tmp_path):
+        seen_questions = []
+
+        def answerer(ask):
+            seen_questions.append(ask.payload.question)
+            return False
+
+        loop = make_loop(
+            responses=[
+                assistant_tool_call("run_command", {"argv": ["rm", "-rf", "build"]}),
+                assistant_text("held off"),
+            ],
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+            ask_answerer=answerer,
+            output_root=tmp_path,
+        )
+        loop.run_turn("clean up")
+
+        assert len(seen_questions) == 1
+        assert "run_command" in seen_questions[0]
+        assert "rm" in seen_questions[0]
+        assert "build" in seen_questions[0]
+
+    def test_ask_payload_expected_carries_the_structured_call(self, tmp_path):
+        seen_asks = []
+
+        def answerer(ask):
+            seen_asks.append(ask)
+            return False
+
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["ls", "-la"]}), assistant_text("held off")],
+            interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+            ask_answerer=answerer,
+            output_root=tmp_path,
+        )
+        loop.run_turn("list")
+
+        assert seen_asks[0].payload.expected == {"action": "run_command", "args": {"argv": ["ls", "-la"]}}
+
+
+class TestProviderErrorHandling:
+    """A model-call failure (a 429, a malformed response, ...) must not
+    crash the whole turn — it becomes a clear, reported failure instead."""
+
+    class RaisingProvider:
+        def __init__(self, exc):
+            self._exc = exc
+
+        def complete(self, messages, tools=None):
+            raise self._exc
+
+    def test_run_turn_reports_a_provider_error_instead_of_crashing(self, tmp_path):
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=self.RaisingProvider(ProviderError("rate limited (429)")),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+        )
+        result = loop.run_turn("hello")
+        assert "model error" in result.lower()
+        assert "429" in result
+
+    def test_run_turn_still_commits_whatever_was_already_in_the_turn(self, tmp_path):
+        workbench = ContextWorkbench()
+        loop = AgentLoop(
+            workbench=workbench,
+            provider=self.RaisingProvider(ProviderError("boom")),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+        )
+        loop.run_turn("hello")
+        assert len(workbench.turns) == 1
+        assert workbench.turns[0][0].content == "hello"
+
+    def test_run_delegated_reports_a_provider_error_as_an_error_result(self, tmp_path):
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=self.RaisingProvider(ProviderError("boom")),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+            enable_delegated_completion=True,
+        )
+        result = loop.run_delegated("go")
+        assert result.status == "error"
+        assert "model error" in result.summary.lower()
+
+
+class TestDeadlineExceededHandling:
+    """A bus call that times out must be reported as a tool result, not
+    left to crash the turn."""
+
+    def test_dispatch_timeout_is_reported_not_raised(self, tmp_path):
+        def timing_out(call):
+            raise DeadlineExceeded("timed out waiting for reply")
+
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["sleep", "100"]}), assistant_text("gave up waiting")],
+            dispatch=timing_out,
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+        assert loop.run_turn("run something slow") == "gave up waiting"
+
+
+class TestCallDeadlinesAreConsistent:
+    """Every dispatched CALL needs a deadline comfortably longer than
+    whatever it wraps — the shell worker's own 60s command timeout, or a
+    delegated run's several model round-trips — not the bus's generic 30s
+    default, which used to be shorter than both."""
+
+    def test_run_command_gets_a_deadline_longer_than_the_shell_workers_own_timeout(self, tmp_path):
+        captured = []
+
+        def dispatch(call):
+            captured.append(call)
+            return ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="exit 0"))
+
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["ls"]}), assistant_text("done")],
+            dispatch=dispatch,
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+        loop.run_turn("list")
+
+        assert captured[0].deadline_ms is not None
+        assert captured[0].deadline_ms > 60_000  # the shell worker's own default command timeout
+
+    def test_delegate_skill_gets_a_generous_deadline(self, tmp_path):
+        captured = []
+
+        def dispatch(call):
+            captured.append(call)
+            return ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="done"))
+
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider(
+                [assistant_tool_call("delegate_skill", {"name": "x", "brief": "go"}), assistant_text("done")]
+            ),
+            output_store=OutputStore(tmp_path),
+            dispatch=dispatch,
+            skill_runner_target="skill.runner",
+        )
+        loop.run_turn("delegate")
+
+        assert captured[0].deadline_ms is not None
+        assert captured[0].deadline_ms >= 120_000  # room for several model round-trips

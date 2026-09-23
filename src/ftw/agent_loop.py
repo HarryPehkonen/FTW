@@ -1,25 +1,48 @@
 """The agent loop: model -> interceptor -> bus -> result cycle
 (ftw_plan.md §3.4).
 
-This is the one place that cycle is implemented. The REPL drives it for
-interactive turns; the delegated skill runner (Phase 3) will drive the same
-class with a fresh, isolated workbench instead of the session's shared one.
+This is the one place that cycle is implemented, as a single shared
+generator (``_step_loop``) driven differently by interactive and
+delegated modes:
+
+* ``run_turn`` (interactive) drives it synchronously — every question the
+  generator ``yield``s is answered immediately via ``ask_answerer``, in
+  the same call, and the final ``ResultPayload.summary`` becomes the chat
+  reply.
+* ``run_delegated``/``resume_delegated`` (Mode A, ftw_plan.md §3.2, §8
+  Phase 3) drive it by *suspending*: the first question yielded is handed
+  back to the caller as a :class:`DelegatedSuspension` instead of being
+  answered, and the paused generator itself — Python's own machinery, not
+  a hand-rolled state machine — holds everything needed to resume later,
+  including from a completely different call, in a different process's
+  request handler (``skills/runner.py`` stashes it by resume_token). No
+  local human is needed to answer a delegated run's own interceptor ASK;
+  it surfaces to whoever's driving the run exactly like a worker's own
+  ASK does (see below) — the same mechanism serves both, so nothing
+  extra was needed to support it.
 
 Three kinds of tool call a model can make, handled differently on purpose:
 
-* **Local tools** (``pin``, ``unpin``, ``read_output``, ``grep_output``, and
-  ``submit_result`` when delegated completion is enabled) — pure
-  workbench/output-store reads and writes, no host side effects. Never
-  pass through the interceptor; there's nothing to confirm.
+* **Local tools** (``pin``, ``unpin``, ``read_output``, ``grep_output``) —
+  pure workbench/output-store reads and writes, no host side effects.
+  Never pass through the interceptor; there's nothing to confirm.
+  ``submit_result`` (delegated mode only) is handled inline in
+  ``_step_loop`` rather than as a local tool, since it ends the run.
 * **Intercepted calls** — go through
   :class:`~ftw.intercept.PreCommitInterceptor` first. ``ALLOW`` executes
-  immediately; ``ASK`` calls the injected ``confirm`` callback and only
-  executes on a yes; ``BLOCK`` never executes and never asks. Two flavors:
-  - **Bus tools** (``run_command``, ...) dispatched as a CALL over the bus.
-    If the worker itself replies ``ASK`` (not the interceptor — the worker
-    mid-computation needing an answer, ftw_plan.md §4 "Mid-call
-    interaction"), ``_run_tool_call`` answers it via ``ask_answerer`` and
-    redispatches, looping until a ``RESULT``/``ERROR`` or a round cap.
+  immediately; ``ASK`` yields an ``AskEnvelope`` (carrying the actual
+  action and arguments, not just the interceptor's reason) and only
+  executes if the answer is exactly ``True``; ``BLOCK`` never executes
+  and never asks. Two flavors:
+  - **Bus tools** (``run_command``, ``delegate_skill``) dispatched as a
+    CALL over the bus, with a deadline comfortably longer than whatever
+    they wrap (see ``DEFAULT_CALL_DEADLINES_MS``) — a ``DeadlineExceeded``
+    or a Ctrl-C ``KeyboardInterrupt`` during dispatch is reported back as
+    a tool result, not left to crash the turn. If the worker itself
+    replies ``ASK`` (not the interceptor — the worker mid-computation
+    needing an answer, ftw_plan.md §4 "Mid-call interaction"), that's
+    yielded too and redispatched once answered, looping until a
+    ``RESULT``/``ERROR`` or a round cap.
   - **Frame tools** (``find_skill``, ``mount_skill``, ``unmount_skill`` —
     ftw_plan.md §3.2 "Self-Mounting") execute locally against the shared
     :class:`~ftw.frames.FrameTree` instead of over the bus, since mounting
@@ -28,49 +51,38 @@ Three kinds of tool call a model can make, handled differently on purpose:
 * **Unknown tool names** — reported back to the model as an error, without
   touching the interceptor or the bus at all.
 
-The default ``confirm`` denies everything and the default ``ask_answerer``
-declines everything: with no REPL/human wired up to answer, failing closed
-is the only safe default.
+The default ``ask_answerer`` declines everything: with no REPL/human wired
+up to answer, failing closed is the only safe default. Only an answer of
+exactly ``True`` allows an intercepted call through — a free-text answer
+("nope", "cancel", any non-empty string) declines it rather than being
+coerced to a truthy bool, the same way ``False``/empty does.
 
-**Delegated completion** (``enable_delegated_completion=True``,
-ftw_plan.md §3.2 Mode A, §8 Phase 3): ``run_delegated`` drives the same
-tool-dispatch machinery as ``run_turn`` but runs to a *structured*
-completion instead of a chat reply — the model must call ``submit_result``
-to finish, and that's the only thing the caller's own context ever grows
-by. This is what the delegated skill runner (``skills/runner.py``) drives
-with a fresh, isolated workbench per call; nothing about the callee's
-intermediate deliberation crosses back to the caller.
-
-**ASK passthrough for a delegated run's own interceptor.** There's no
-local human at a delegated run's process to answer a blocking ``confirm``.
-So a delegated run's interceptor ASK doesn't block — ``run_delegated``
-*suspends*, returning a :class:`DelegatedSuspension` (an ``AskEnvelope``
-plus opaque state) instead of a ``ResultPayload``. Whoever's driving the
-run (``skills/runner.py``) stashes that state, keyed by resume_token, and
-calls ``resume_delegated`` once an answer arrives — which, on the
-interactive side, happens automatically: this suspension surfaces to the
-REPL as an ordinary worker-initiated ASK (see above), already handled by
-``_resolve_worker_asks``. No new machinery was needed on that end; a
-delegated run's own ASK and a worker's own ASK look identical to a caller.
-
-Tool_calls in one batch are resolved one at a time (not all-at-once) so a
-suspension partway through a batch can resume cleanly: whatever was
-already resolved stays resolved, and the rest of the batch picks up right
-after the answer.
+Every message is tagged with whatever frame has focus at the moment it's
+actually produced (ftw_plan.md §3.2), not retroactively when the turn
+commits: the assistant's own decision to mount/unmount is tagged with
+focus as of before that decision takes effect, and each tool result is
+tagged with focus as of just after it ran, since a mount_skill/
+unmount_skill call can itself change what's focused mid-batch. This is
+what makes the mount/unmount invariant hold even when a model mounts,
+works, and unmounts all within a single reply — its natural self-mount
+pattern, not just the two-separate-turns case.
 
 **Cooperative cancellation** (``cancel_flag``): checked between steps of
 a delegated run, since a blocked ``provider.complete()`` call can't be
 preempted. Set by ``skills/runner.py`` in response to a ``CANCEL`` on its
-control channel.
+control channel; captured once, in the generator's own closure, when the
+run starts — a resume doesn't need it re-supplied.
 """
 
 from __future__ import annotations
 
+import json
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable
+from dataclasses import dataclass
+from typing import Any, Callable, Generator
 from uuid import uuid4
 
+from ftw.bus import DeadlineExceeded
 from ftw.frames import FrameBudgetExceeded, FrameNotFound, FramePinned, FrameTree, SkillAlreadyMounted
 from ftw.intercept import InterceptDecision, PreCommitInterceptor
 from ftw.outputs import OutputNotFound, OutputStore
@@ -90,58 +102,31 @@ from ftw.protocol import (
     ResultEnvelope,
     ResultPayload,
 )
-from ftw.providers import ChatMessage, ChatRole, IModelProvider, ToolCall, ToolSpec
+from ftw.providers import ChatMessage, ChatRole, IModelProvider, ProviderError, ToolCall, ToolSpec
+from ftw.skills.manifest import SkillParseError
 from ftw.skills.registry import SkillNotFound
 from ftw.workbench import ContextWorkbench, WorkbenchBudgetExceeded
 
 Dispatch = Callable[[AnyEnvelope], AnyEnvelope]  # a CallEnvelope, or an AnswerEnvelope relaying a worker's ASK
-Confirm = Callable[[CallEnvelope], bool]
 AskAnswerer = Callable[[AskEnvelope], Any]
 EventSink = Callable[[EventEnvelope], None]
 LocalToolHandler = Callable[[dict[str, Any]], str]
 CancelFlag = Any  # duck-typed: anything with a no-arg is_set() -> bool, e.g. threading.Event
+StepGenerator = Generator[AskEnvelope, Any, ResultPayload]
+ToolCallGenerator = Generator[AskEnvelope, Any, str]
 
 MAX_WORKER_ASK_ROUNDS = 10
 
-_NO_ANSWER = object()  # sentinel: "no pre-supplied answer for this tool_call"
-
-
-class _SubmitResult(Exception):
-    """Raised by the submit_result local tool to unwind run_delegated's
-    loop with a structured payload instead of an ordinary tool-result
-    string."""
-
-    def __init__(self, payload: ResultPayload):
-        self.payload = payload
-        self.resolved_so_far: list[ChatMessage] = []
-
-
-class _NeedsAnswer(Exception):
-    """Raised (only in suspendable/delegated mode) when the interceptor's
-    own ASK decision needs an external answer instead of a blocking
-    confirm(). Carries just what run_delegated needs to build a
-    DelegatedSuspension; everything else about where to resume is
-    captured by the caller."""
-
-    def __init__(self, ask: AskEnvelope):
-        self.ask = ask
-
-
-class Cancelled(Exception):
-    """Internal signal that a cancel_flag was set; converted into an
-    error ResultPayload before it ever leaves run_delegated/resume_delegated."""
-
-
-@dataclass
-class _DelegatedState:
-    turn: list[ChatMessage]  # up to and including the assistant message with tool_calls
-    tool_calls: list[ToolCall]  # this step's full tool_calls list
-    index: int  # which one needs an answer
-    resolved: list[ChatMessage] = field(default_factory=list)  # TOOL messages already produced for tool_calls[:index]
-    step: int = 0
-    start: float = 0.0
-    total_tokens: int = 0
-    cancel_flag: "CancelFlag | None" = None  # carried forward so resume_delegated doesn't need it re-supplied
+# Every CALL gets a deadline comfortably longer than whatever it wraps, so
+# a slow-but-legitimate command doesn't get mistaken for a hung one.
+# run_command: the shell worker's own default command timeout is 60s
+# (tools/shell.py). delegate_skill: a delegated run may need several
+# model round-trips plus its own tool calls, so it gets much more room.
+DEFAULT_CALL_DEADLINES_MS: dict[str, int] = {
+    "run_command": 65_000,
+    "delegate_skill": 300_000,
+}
+FALLBACK_CALL_DEADLINE_MS = 30_000
 
 
 @dataclass
@@ -149,11 +134,11 @@ class DelegatedSuspension:
     """Returned by run_delegated/resume_delegated in place of a
     ResultPayload when the run needs external input before it can
     continue. ``ask`` is the only part meant to be read by the caller —
-    the rest is opaque state to be stashed and handed back verbatim to
-    resume_delegated."""
+    the paused generator itself carries the rest of the state."""
 
     ask: AskEnvelope
-    _state: _DelegatedState
+    _generator: StepGenerator
+    _cancel_flag: CancelFlag | None = None
 
 
 SUBMIT_RESULT_TOOL_SPEC = ToolSpec(
@@ -286,7 +271,6 @@ class AgentLoop:
         output_store: OutputStore,
         dispatch: Dispatch,
         interceptor: PreCommitInterceptor | None = None,
-        confirm: Confirm | None = None,
         ask_answerer: AskAnswerer | None = None,
         control_dispatch: Dispatch | None = None,
         frame_tree: FrameTree | None = None,
@@ -294,6 +278,7 @@ class AgentLoop:
         skill_runner_target: str | None = None,
         extra_tool_specs: list[ToolSpec] | None = None,
         tool_targets: dict[str, str] | None = None,
+        call_deadlines_ms: dict[str, int] | None = None,
         max_steps: int = 15,
         source_id: str = "repl.master",
         trace_id: str | None = None,
@@ -307,11 +292,11 @@ class AgentLoop:
         self._outputs = output_store
         self._dispatch = dispatch
         self._interceptor = interceptor or PreCommitInterceptor([])
-        self._confirm: Confirm = confirm or (lambda call: False)  # fail closed
         self._ask_answerer: AskAnswerer = ask_answerer or (lambda ask: False)  # fail closed
         self._control_dispatch = control_dispatch
         self._tool_specs = list(BUILTIN_TOOL_SPECS) + list(extra_tool_specs or [])
         self._tool_targets = {**DEFAULT_TOOL_TARGETS, **(tool_targets or {})}
+        self._call_deadlines_ms = {**DEFAULT_CALL_DEADLINES_MS, **(call_deadlines_ms or {})}
         self._max_steps = max_steps
         self._source_id = source_id
         self._on_event = on_event
@@ -325,7 +310,6 @@ class AgentLoop:
         }
         if enable_delegated_completion:
             self._tool_specs.append(SUBMIT_RESULT_TOOL_SPEC)
-            self._local_tools["submit_result"] = self._handle_submit_result
 
         if skill_runner_target is not None:
             self._tool_specs.append(DELEGATE_SKILL_TOOL_SPEC)
@@ -340,32 +324,18 @@ class AgentLoop:
                 "unmount_skill": self._handle_unmount_skill,
             }
 
+    # -- public entry points --------------------------------------------
+
     def run_turn(self, user_input: str) -> str:
-        turn: list[ChatMessage] = [ChatMessage(role=ChatRole.USER, content=user_input)]
-
-        for step in range(self._max_steps):
-            self._emit("event.model.request", {"step": step, "message_count": len(turn)})
-            response = self.provider.complete(self.workbench.render_prompt(turn), tools=self._tool_specs)
-            self._emit(
-                "event.model.response",
-                {"step": step, "has_tool_calls": bool(response.message.tool_calls), "tool_call_count": len(response.message.tool_calls)},
-            )
-            turn.append(response.message)
-
-            if not response.message.tool_calls:
-                self.workbench.add_turn(turn, frame_id=self._current_frame_id())
-                return response.message.content or ""
-
-            for tool_call in response.message.tool_calls:
-                content = self._run_tool_call(tool_call)
-                turn.append(
-                    ChatMessage(role=ChatRole.TOOL, tool_call_id=tool_call.id, name=tool_call.name, content=content)
-                )
-
-        final = f"[step budget exceeded after {self._max_steps} steps without a final answer]"
-        turn.append(ChatMessage(role=ChatRole.ASSISTANT, content=final))
-        self.workbench.add_turn(turn, frame_id=self._current_frame_id())
-        return final
+        gen = self._step_loop(ChatMessage(role=ChatRole.USER, content=user_input))
+        answer: Any = None
+        while True:
+            try:
+                ask = gen.send(answer)
+            except StopIteration as stop:
+                result: ResultPayload = stop.value
+                return result.summary
+            answer = self._ask_answerer(ask)
 
     def run_delegated(self, brief: str, *, cancel_flag: CancelFlag | None = None) -> ResultPayload | DelegatedSuspension:
         """Runs to a structured completion instead of a chat reply — the
@@ -374,139 +344,114 @@ class AgentLoop:
         practice, its own fresh workbench (ftw_plan.md §3.2 Mode A).
 
         Returns a DelegatedSuspension instead of a ResultPayload if the
-        run's own interceptor needs an answer before it can continue —
-        resume with resume_delegated once one arrives."""
+        run needs an answer before it can continue — resume with
+        resume_delegated once one arrives."""
         if not self._delegated_enabled:
             raise RuntimeError("this AgentLoop wasn't constructed with enable_delegated_completion=True")
-
-        turn: list[ChatMessage] = [ChatMessage(role=ChatRole.USER, content=brief)]
-        return self._delegated_loop(turn, step=0, start=time.monotonic(), total_tokens=0, cancel_flag=cancel_flag)
+        gen = self._step_loop(ChatMessage(role=ChatRole.USER, content=brief), cancel_flag=cancel_flag)
+        return self._drive_delegated(gen, None, cancel_flag=cancel_flag)
 
     def resume_delegated(self, suspension: DelegatedSuspension, answer_value: Any) -> ResultPayload | DelegatedSuspension:
-        """Continues a run exactly where it suspended: finishes the
-        tool_call that was waiting on ``answer_value``, then the rest of
-        that batch, then any further steps — all via the same machinery
-        run_delegated itself uses, so a second ask mid-resume is handled
-        identically to the first. Uses the same cancel_flag the original
-        run_delegated call was given, if any — carried forward on the
-        suspension itself so callers don't need to re-supply it."""
+        """Continues a run exactly where it suspended — the paused
+        generator itself is the entire resumable state, so this is just
+        sending the answer into it."""
         if not self._delegated_enabled:
             raise RuntimeError("this AgentLoop wasn't constructed with enable_delegated_completion=True")
+        return self._drive_delegated(suspension._generator, answer_value, cancel_flag=suspension._cancel_flag)
 
-        state = suspension._state
-        try:
-            self._check_cancelled(state.cancel_flag)
-            batch_result = self._process_batch(
-                state.turn, state.tool_calls, state.index, state.resolved, initial_answer=answer_value
-            )
-        except _SubmitResult as done:
-            return self._finish_with_submit_result(state.turn, done, state.start, state.total_tokens)
-        except Cancelled:
-            return self._cancelled_result(state.start, state.total_tokens)
-
-        if isinstance(batch_result, DelegatedSuspension):
-            batch_result._state.step = state.step
-            batch_result._state.start = state.start
-            batch_result._state.total_tokens = state.total_tokens
-            batch_result._state.cancel_flag = state.cancel_flag
-            return batch_result
-
-        turn = list(state.turn)
-        turn.extend(batch_result)
-        return self._delegated_loop(turn, state.step + 1, state.start, state.total_tokens, state.cancel_flag)
-
-    def _delegated_loop(
-        self, turn: list[ChatMessage], step: int, start: float, total_tokens: int, cancel_flag: CancelFlag | None
+    def _drive_delegated(
+        self, gen: StepGenerator, send_value: Any, *, cancel_flag: CancelFlag | None
     ) -> ResultPayload | DelegatedSuspension:
-        for s in range(step, self._max_steps):
-            try:
-                self._check_cancelled(cancel_flag)
-            except Cancelled:
-                return self._cancelled_result(start, total_tokens)
+        try:
+            ask = gen.send(send_value)
+        except StopIteration as stop:
+            return stop.value
+        return DelegatedSuspension(ask=ask, _generator=gen, _cancel_flag=cancel_flag)
 
-            self._emit("event.model.request", {"step": s, "message_count": len(turn)})
-            response = self.provider.complete(self.workbench.render_prompt(turn), tools=self._tool_specs)
+    # -- the shared step loop --------------------------------------------
+
+    def _step_loop(self, initial_message: ChatMessage, *, cancel_flag: CancelFlag | None = None) -> StepGenerator:
+        tagged: list[tuple[str | None, ChatMessage]] = [(self._current_frame_id(), initial_message)]
+        plain: list[ChatMessage] = [initial_message]
+        start = time.monotonic()
+        total_tokens = 0
+
+        for step in range(self._max_steps):
+            if self._is_cancelled(cancel_flag):
+                return self._commit(tagged, self._cancelled_result(start, total_tokens))
+
+            self._emit("event.model.request", {"step": step, "message_count": len(plain)})
+            try:
+                response = self.provider.complete(self.workbench.render_prompt(plain), tools=self._tool_specs)
+            except ProviderError as exc:
+                return self._commit(
+                    tagged, ResultPayload(status="error", summary=f"model error: {exc}", cost=self._cost(start, total_tokens))
+                )
             total_tokens += self._usage_tokens(response.usage)
             self._emit(
                 "event.model.response",
-                {"step": s, "has_tool_calls": bool(response.message.tool_calls), "tool_call_count": len(response.message.tool_calls)},
+                {
+                    "step": step,
+                    "has_tool_calls": bool(response.message.tool_calls),
+                    "tool_call_count": len(response.message.tool_calls),
+                },
             )
-            turn.append(response.message)
+
+            tagged.append((self._current_frame_id(), response.message))
+            plain.append(response.message)
 
             if not response.message.tool_calls:
-                # Forgiving fallback: a delegated skill that just replies with
-                # text instead of calling submit_result still produces a
-                # usable Result rather than an outright failure.
-                self.workbench.add_turn(turn, frame_id=self._current_frame_id())
-                return ResultPayload(
-                    status="ok", summary=response.message.content or "", cost=self._delegated_cost(start, total_tokens)
+                return self._commit(
+                    tagged,
+                    ResultPayload(status="ok", summary=response.message.content or "", cost=self._cost(start, total_tokens)),
                 )
 
-            try:
-                batch_result = self._process_batch(turn, response.message.tool_calls, 0, [])
-            except _SubmitResult as done:
-                return self._finish_with_submit_result(turn, done, start, total_tokens)
+            for tool_call in response.message.tool_calls:
+                if tool_call.name == "submit_result" and self._delegated_enabled:
+                    payload = self._build_submit_result(tool_call.arguments, start, total_tokens)
+                    msg = ChatMessage(role=ChatRole.TOOL, tool_call_id=tool_call.id, name=tool_call.name, content="(submitted)")
+                    tagged.append((self._current_frame_id(), msg))
+                    return self._commit(tagged, payload)
 
-            if isinstance(batch_result, DelegatedSuspension):
-                batch_result._state.step = s
-                batch_result._state.start = start
-                batch_result._state.total_tokens = total_tokens
-                batch_result._state.cancel_flag = cancel_flag
-                return batch_result
+                content = yield from self._run_tool_call(tool_call, cancel_flag=cancel_flag)
+                msg = ChatMessage(role=ChatRole.TOOL, tool_call_id=tool_call.id, name=tool_call.name, content=content)
+                tagged.append((self._current_frame_id(), msg))
+                plain.append(msg)
+                # Re-checked here, not just at the top of the step: a
+                # suspended ask resumes *inside* _run_tool_call, well past
+                # that check, so a cancel arriving while paused would
+                # otherwise only be noticed one whole step too late.
+                if self._is_cancelled(cancel_flag):
+                    return self._commit(tagged, self._cancelled_result(start, total_tokens))
 
-            turn.extend(batch_result)
-
-        self.workbench.add_turn(turn, frame_id=self._current_frame_id())
-        return ResultPayload(
-            status="error",
-            summary=f"step budget exceeded after {self._max_steps} steps without submit_result",
-            cost=self._delegated_cost(start, total_tokens),
+        return self._commit(
+            tagged,
+            ResultPayload(
+                status="error",
+                summary=f"step budget exceeded after {self._max_steps} steps",
+                cost=self._cost(start, total_tokens),
+            ),
         )
 
-    def _process_batch(
-        self,
-        turn: list[ChatMessage],
-        tool_calls: list[ToolCall],
-        start_index: int,
-        resolved: list[ChatMessage],
-        *,
-        initial_answer: Any = _NO_ANSWER,
-    ) -> list[ChatMessage] | DelegatedSuspension:
-        """Resolves tool_calls[start_index:] one at a time — not as one
-        all-or-nothing batch — so a suspension partway through leaves
-        everything before it genuinely resolved. Raises _SubmitResult
-        (uncaught here, on purpose) if submit_result is among them."""
-        resolved = list(resolved)
-        for i in range(start_index, len(tool_calls)):
-            tool_call = tool_calls[i]
-            answer = initial_answer if i == start_index else _NO_ANSWER
-            try:
-                content = self._run_tool_call(tool_call, suspendable=True, pending_answer=answer)
-            except _NeedsAnswer as need:
-                state = _DelegatedState(turn=list(turn), tool_calls=list(tool_calls), index=i, resolved=resolved)
-                return DelegatedSuspension(ask=need.ask, _state=state)
-            except _SubmitResult as done:
-                done.resolved_so_far = resolved
-                raise
-            resolved.append(ChatMessage(role=ChatRole.TOOL, tool_call_id=tool_call.id, name=tool_call.name, content=content))
-        return resolved
+    def _commit(self, tagged: list[tuple[str | None, ChatMessage]], payload: ResultPayload) -> ResultPayload:
+        self.workbench.add_tagged_turn(tagged)
+        return payload
 
-    def _finish_with_submit_result(
-        self, turn: list[ChatMessage], done: _SubmitResult, start: float, total_tokens: int
-    ) -> ResultPayload:
-        full_turn = list(turn)
-        full_turn.extend(done.resolved_so_far)
-        self.workbench.add_turn(full_turn, frame_id=self._current_frame_id())
-        done.payload.cost = self._delegated_cost(start, total_tokens)
-        return done.payload
+    def _build_submit_result(self, args: dict[str, Any], start: float, total_tokens: int) -> ResultPayload:
+        return ResultPayload(
+            status=args.get("status", "ok"),
+            summary=args.get("summary", ""),
+            outputs=args.get("outputs") or {},
+            evidence=args.get("evidence") or [],
+            cost=self._cost(start, total_tokens),
+        )
 
     @staticmethod
-    def _check_cancelled(cancel_flag: CancelFlag | None) -> None:
-        if cancel_flag is not None and cancel_flag.is_set():
-            raise Cancelled()
+    def _is_cancelled(cancel_flag: CancelFlag | None) -> bool:
+        return cancel_flag is not None and cancel_flag.is_set()
 
     def _cancelled_result(self, start: float, total_tokens: int) -> ResultPayload:
-        return ResultPayload(status="error", summary="cancelled by user", cost=self._delegated_cost(start, total_tokens))
+        return ResultPayload(status="error", summary="cancelled by user", cost=self._cost(start, total_tokens))
 
     @staticmethod
     def _usage_tokens(usage: dict[str, int]) -> int:
@@ -515,23 +460,20 @@ class AgentLoop:
         return usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
 
     @staticmethod
-    def _delegated_cost(start: float, total_tokens: int) -> dict[str, int]:
+    def _cost(start: float, total_tokens: int) -> dict[str, int]:
         cost = {"wall_time_ms": int((time.monotonic() - start) * 1000)}
         if total_tokens:
             cost["tokens"] = total_tokens
         return cost
 
     def _current_frame_id(self) -> str | None:
-        """Which frame a turn or pin committed *right now* belongs to — the
-        one with focus, or none if there's no frame tree or nothing
-        mounted. Turns and pins are tagged when they're committed, not
-        retroactively, so a mount/unmount that happens earlier in the same
-        turn is what determines this, not what's focused later."""
+        """Which frame a message produced *right now* belongs to — the one
+        with focus, or none if there's no frame tree or nothing mounted."""
         return self.frame_tree.focused_frame_id if self.frame_tree is not None else None
 
     # -- tool dispatch --------------------------------------------------
 
-    def _run_tool_call(self, tool_call: ToolCall, *, suspendable: bool = False, pending_answer: Any = _NO_ANSWER) -> str:
+    def _run_tool_call(self, tool_call: ToolCall, *, cancel_flag: CancelFlag | None = None) -> ToolCallGenerator:
         if tool_call.name in self._local_tools:
             return self._local_tools[tool_call.name](tool_call.arguments)
 
@@ -544,6 +486,7 @@ class AgentLoop:
             source=self._source_id,
             target=target,
             trace_id=self.trace_id,
+            deadline_ms=self._call_deadlines_ms.get(tool_call.name, FALLBACK_CALL_DEADLINE_MS),
             payload=CallPayload(action=tool_call.name, args=tool_call.arguments),
         )
 
@@ -558,24 +501,27 @@ class AgentLoop:
             return f"blocked: {outcome.reason}"
 
         if outcome.decision == InterceptDecision.ASK:
-            if pending_answer is not _NO_ANSWER:
-                allowed = bool(pending_answer)
-            elif suspendable:
-                # No local human at this process to block on — suspend the
-                # whole delegated run instead (ftw_plan.md §8 Phase 3 "ASK
-                # passthrough"). Caught by _process_batch.
-                resume_token = uuid4().hex
-                raise _NeedsAnswer(
-                    AskEnvelope(
-                        source=self._source_id,
-                        target=call.source,
-                        trace_id=self.trace_id,
-                        payload=AskPayload(question=outcome.reason or f"Allow {tool_call.name}?", resume_token=resume_token),
-                    )
-                )
-            else:
-                allowed = self._confirm(call)
-            if not allowed:
+            resume_token = uuid4().hex
+            answer = yield AskEnvelope(
+                source=self._source_id,
+                target=call.source,
+                trace_id=self.trace_id,
+                payload=AskPayload(
+                    question=self._render_ask_question(tool_call, outcome.reason),
+                    resume_token=resume_token,
+                    expected={"action": tool_call.name, "args": tool_call.arguments},
+                ),
+            )
+            if self._is_cancelled(cancel_flag):
+                # A resumed ask lands here, well past _step_loop's own
+                # per-step check — this is the one that actually matters
+                # for "cancelled while suspended, waiting on an answer".
+                return "cancelled by user"
+            # Only an explicit True allows. Anything else — False, an
+            # empty answer, or a free-text answer like "nope" or "cancel"
+            # — declines, rather than being coerced through bool(), which
+            # would treat any non-empty string as an approval.
+            if answer is not True:
                 self._emit("event.tool.result", {"action": tool_call.name, "status": "declined"})
                 return f"declined by user: {outcome.reason}"
 
@@ -585,13 +531,48 @@ class AgentLoop:
             return content
 
         try:
-            reply = self._resolve_worker_asks(self._dispatch(call))
+            reply = self._dispatch(call)
         except KeyboardInterrupt:
-            self._send_cancel(call)
-            self._emit("event.tool.result", {"action": tool_call.name, "status": "cancelled"})
-            return f"cancelled by user (Ctrl-C) while running {tool_call.name!r}"
+            return self._cancelled_tool_content(call, tool_call.name)
+        except DeadlineExceeded as exc:
+            return self._timed_out_tool_content(tool_call.name, exc)
+
+        rounds = 0
+        while isinstance(reply, AskEnvelope) and rounds < MAX_WORKER_ASK_ROUNDS:
+            rounds += 1
+            value = yield reply
+            if self._is_cancelled(cancel_flag):
+                return "cancelled by user"
+            answer_env = AnswerEnvelope(
+                source=self._source_id,
+                target=reply.source,
+                trace_id=self.trace_id,
+                payload=AnswerPayload(resume_token=reply.payload.resume_token, value=value),
+            )
+            try:
+                reply = self._dispatch(answer_env)
+            except KeyboardInterrupt:
+                return self._cancelled_tool_content(call, tool_call.name)
+            except DeadlineExceeded as exc:
+                return self._timed_out_tool_content(tool_call.name, exc)
+
         self._emit("event.tool.result", {"action": tool_call.name, "status": self._reply_status(reply)})
         return self._reply_to_content(reply)
+
+    def _cancelled_tool_content(self, call: CallEnvelope, tool_name: str) -> str:
+        self._send_cancel(call)
+        self._emit("event.tool.result", {"action": tool_name, "status": "cancelled"})
+        return f"cancelled by user (Ctrl-C) while running {tool_name!r}"
+
+    def _timed_out_tool_content(self, tool_name: str, exc: DeadlineExceeded) -> str:
+        self._emit("event.tool.result", {"action": tool_name, "status": "timeout"})
+        return f"error: {tool_name} timed out: {exc}"
+
+    @staticmethod
+    def _render_ask_question(tool_call: ToolCall, reason: str) -> str:
+        args_text = json.dumps(tool_call.arguments, separators=(",", ": "), sort_keys=True)
+        base = reason or f"Allow {tool_call.name}?"
+        return f"{base} — {tool_call.name}({args_text}) [y/N]"
 
     def _send_cancel(self, call: CallEnvelope) -> None:
         """Best-effort: tells the target worker to stop an in-flight call
@@ -629,26 +610,6 @@ class AgentLoop:
             )
         except Exception:
             pass
-
-    def _resolve_worker_asks(self, reply: AnyEnvelope) -> AnyEnvelope:
-        """A worker can reply ASK instead of RESULT/ERROR when it needs an
-        answer mid-computation (ftw_plan.md §4 "Mid-call interaction") —
-        distinct from the interceptor's own ASK, which is resolved before
-        dispatch ever happens. Answered via ask_answerer and redispatched
-        to the same target the original call went to, bounded so a
-        misbehaving worker can't loop this forever."""
-        rounds = 0
-        while isinstance(reply, AskEnvelope) and rounds < MAX_WORKER_ASK_ROUNDS:
-            rounds += 1
-            value = self._ask_answerer(reply)
-            answer = AnswerEnvelope(
-                source=self._source_id,
-                target=reply.source,
-                trace_id=self.trace_id,
-                payload=AnswerPayload(resume_token=reply.payload.resume_token, value=value),
-            )
-            reply = self._dispatch(answer)
-        return reply
 
     @staticmethod
     def _reply_status(reply: AnyEnvelope) -> str:
@@ -714,23 +675,16 @@ class AgentLoop:
             return f"error: {exc}"
         return "\n".join(matches) if matches else "(no matches)"
 
-    def _handle_submit_result(self, args: dict[str, Any]) -> str:
-        raise _SubmitResult(
-            ResultPayload(
-                status=args.get("status", "ok"),
-                summary=args.get("summary", ""),
-                outputs=args.get("outputs") or {},
-                evidence=args.get("evidence") or [],
-            )
-        )
-
     # -- frame tools (find_skill / mount_skill / unmount_skill) -----------
 
     def _handle_find_skill(self, args: dict[str, Any]) -> str:
         query = args.get("query")
         if not query:
             return "error: find_skill requires 'query'"
-        results = self.frame_tree.find(query, top_k=args.get("top_k", 5))
+        try:
+            results = self.frame_tree.find(query, top_k=args.get("top_k", 5))
+        except SkillParseError as exc:
+            return f"error: {exc}"
         return ", ".join(results) if results else "(no matching skills)"
 
     def _handle_mount_skill(self, args: dict[str, Any]) -> str:
@@ -739,7 +693,7 @@ class AgentLoop:
             return "error: mount_skill requires 'name'"
         try:
             frame = self.frame_tree.mount(name, owner="model")
-        except (SkillNotFound, SkillAlreadyMounted, FrameBudgetExceeded) as exc:
+        except (SkillNotFound, SkillAlreadyMounted, FrameBudgetExceeded, SkillParseError) as exc:
             return f"error: {exc}"
         return f"mounted {frame.skill_name!r}"
 

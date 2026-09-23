@@ -51,9 +51,18 @@ def _turn_tokens(turn: list[ChatMessage]) -> int:
 
 
 @dataclass
-class _TurnRecord:
+class _TaggedMessage:
     frame_id: str | None
-    messages: list[ChatMessage]
+    message: ChatMessage
+
+
+@dataclass
+class _TurnRecord:
+    tagged: list[_TaggedMessage]
+
+    @property
+    def messages(self) -> list[ChatMessage]:
+        return [tm.message for tm in self.tagged]
 
 
 @dataclass
@@ -154,17 +163,28 @@ class ContextWorkbench:
 
     # -- Turn Horizon: rolling FIFO, oldest turn evicted first ------------
     #
-    # Every turn is tagged with the frame it belongs to (None = the base
-    # session, untagged). Budget-driven eviction below is oldest-first and
-    # frame-agnostic; evict_frame() is the other way a turn leaves the
-    # horizon — an explicit, frame-scoped removal on unmount (ftw_plan.md
-    # §3.2 "Eviction is by subtree").
+    # Every MESSAGE is tagged with the frame it belongs to (None = the base
+    # session, untagged) — not the turn as a whole. A turn where a mount,
+    # some work, and the matching unmount all happen in one reply (the
+    # model's natural self-mount pattern) has messages that belong to
+    # different frames; tagging the whole turn with whatever's focused at
+    # commit time (i.e. after the unmount) meant the frame's own content
+    # was never evicted at all. Budget-driven eviction below is
+    # oldest-turn-first and frame-agnostic; evict_frame() is the other way
+    # content leaves the horizon — an explicit, frame-scoped removal on
+    # unmount (ftw_plan.md §3.2 "Eviction is by subtree") that now works at
+    # message granularity, leaving the rest of a mixed turn in place.
 
-    def add_turn(self, messages: list[ChatMessage], frame_id: str | None = None) -> None:
-        self._turns.append(_TurnRecord(frame_id, list(messages)))
+    def add_tagged_turn(self, tagged_messages: list[tuple[str | None, ChatMessage]]) -> None:
+        self._turns.append(_TurnRecord([_TaggedMessage(fid, m) for fid, m in tagged_messages]))
         while self.turn_horizon_tokens > self._turn_horizon_budget and len(self._turns) > 1:
             evicted = self._turns.pop(0)
             self._fire_turn_evicted(evicted.messages)
+
+    def add_turn(self, messages: list[ChatMessage], frame_id: str | None = None) -> None:
+        """Convenience wrapper for the common case where an entire turn
+        genuinely belongs to one frame (or none)."""
+        self.add_tagged_turn([(frame_id, m) for m in messages])
 
     def clear_turns(self) -> None:
         while self._turns:
@@ -172,15 +192,23 @@ class ContextWorkbench:
             self._fire_turn_evicted(evicted.messages)
 
     def evict_frame(self, frame_id: str) -> list[list[ChatMessage]]:
-        """Removes every turn tagged with ``frame_id`` (order preserved) and
-        returns their messages — for the unmounting frame to summarize."""
-        keep, evicted = [], []
+        """Removes every message tagged with ``frame_id``, wherever it
+        appears — a turn that becomes empty is dropped entirely; one that
+        still has other messages keeps them, in their original order.
+        Returns the evicted messages, grouped by their original turn, for
+        the unmounting frame to summarize."""
+        evicted_by_turn: list[list[ChatMessage]] = []
+        remaining: list[_TurnRecord] = []
         for record in self._turns:
-            (evicted if record.frame_id == frame_id else keep).append(record)
-        self._turns = keep
-        for record in evicted:
-            self._fire_turn_evicted(record.messages)
-        return [record.messages for record in evicted]
+            keep = [tm for tm in record.tagged if tm.frame_id != frame_id]
+            evicted = [tm.message for tm in record.tagged if tm.frame_id == frame_id]
+            if evicted:
+                evicted_by_turn.append(evicted)
+                self._fire_turn_evicted(evicted)
+            if keep:
+                remaining.append(_TurnRecord(keep))
+        self._turns = remaining
+        return evicted_by_turn
 
     def _fire_turn_evicted(self, messages: list[ChatMessage]) -> None:
         if self._on_turn_evicted is not None:

@@ -20,6 +20,7 @@ from ftw.protocol import (
     AskPayload,
     CallEnvelope,
     CallPayload,
+    ErrorEnvelope,
     EventEnvelope,
     EventPayload,
     ResultEnvelope,
@@ -299,6 +300,63 @@ class TestIpcTransport:
         with Replier(addr):
             assert path.exists()
         assert not path.exists()
+
+
+class TestHandlerExceptionSafety:
+    """A handler raising anything other than the pynng-level exceptions
+    _worker_loop already expects (Timeout, Closed) must not kill that
+    worker thread outright — the caller gets a clean ErrorEnvelope, and
+    later calls still get served by the same, still-alive worker pool."""
+
+    def test_handler_exception_becomes_an_error_envelope(self, unique_name):
+        addr = inproc_address(unique_name)
+        stop = threading.Event()
+
+        def flaky_handler(env):
+            raise ValueError("boom")
+
+        with Replier(addr) as rep:
+            start_server(rep, flaky_handler, stop)
+            with Requester(addr) as req:
+                reply = req.call(make_call(), timeout_ms=2000)
+            assert isinstance(reply, ErrorEnvelope)
+            assert reply.payload.code == "handler_error"
+            assert "boom" in reply.payload.message
+            stop.set()
+
+    def test_worker_survives_and_serves_the_next_call(self, unique_name):
+        addr = inproc_address(unique_name)
+        stop = threading.Event()
+        calls = []
+
+        def handler(env):
+            calls.append(env)
+            if len(calls) == 1:
+                raise ValueError("first call blows up")
+            return echo_handler(env)
+
+        with Replier(addr, num_workers=1) as rep:  # force the second call onto the SAME worker
+            start_server(rep, handler, stop)
+            with Requester(addr) as req:
+                first = req.call(make_call(), timeout_ms=2000)
+                assert isinstance(first, ErrorEnvelope)
+                second = req.call(make_call(), timeout_ms=2000)
+                assert isinstance(second, ResultEnvelope)
+            stop.set()
+
+    def test_exception_from_a_deduped_idempotent_call_still_replies_cleanly(self, unique_name):
+        addr = inproc_address(unique_name)
+        stop = threading.Event()
+
+        def flaky_handler(env):
+            raise RuntimeError("always fails")
+
+        with Replier(addr) as rep:
+            start_server(rep, flaky_handler, stop)
+            with Requester(addr) as req:
+                reply = req.call(make_call(idempotency_key="k1"), timeout_ms=2000)
+            assert isinstance(reply, ErrorEnvelope)
+            stop.set()
 
 
 class TestDispatchRouter:

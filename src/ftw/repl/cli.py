@@ -25,7 +25,7 @@ from ftw.frames import FrameTree, make_llm_summarizer
 from ftw.intercept import ConfirmShellCommands, PreCommitInterceptor
 from ftw.outputs import OutputStore
 from ftw.providers import IModelProvider
-from ftw.repl.session import InputFn, ReplSession, make_ask_answerer, make_confirm
+from ftw.repl.session import InputFn, ReplSession, make_ask_answerer
 from ftw.runtime import ipc_address
 from ftw.skills.registry import SkillStore
 from ftw.skills.runner import control_address as skill_runner_control_address
@@ -154,6 +154,7 @@ def build_repl_session(
     skills_dir: Path | None = None,
     worker_address: str | None = None,
     skill_runner_address: str | None = None,
+    events_address: str | None = None,
     worker_startup_grace_s: float = DEFAULT_WORKER_STARTUP_GRACE_S,
 ) -> ReplHandle:
     ftw_home = Path(ftw_home)
@@ -187,7 +188,11 @@ def build_repl_session(
     skill_runner_control_requester = Requester(skill_runner_control_address(skill_runner_address))
 
     trace_writer = TraceWriter(traces_root)
-    publisher = Publisher(ipc_address(f"events.{uuid4().hex[:8]}"))
+    # Fixed, well-known address by default — matches observability/tap.py's
+    # own default exactly, on purpose (both call ipc_address("events")),
+    # so `uv run ftw tap` with no arguments finds a real running session.
+    # A random per-session address is only for tests/multi-session use.
+    publisher = Publisher(events_address or ipc_address("events"))
 
     def on_event(evt):
         trace_writer.write(evt)
@@ -205,7 +210,6 @@ def build_repl_session(
         output_store=OutputStore(output_root),
         dispatch=dispatch,
         interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
-        confirm=make_confirm(input_fn, output),
         ask_answerer=make_ask_answerer(input_fn, output),
         control_dispatch=skill_runner_control_requester.call,
         frame_tree=frame_tree,

@@ -261,6 +261,83 @@ class TestFrameTagging:
         assert wb.mounted_skill_budget == 1234
 
 
+class TestPerMessageTagging:
+    """add_turn tags a WHOLE turn with one frame_id — fine when a mount
+    and its unmount land in separate turns, but the model's natural
+    self-mount pattern is mount -> work -> unmount all within one reply,
+    committed as a single turn. Tagging the whole thing with whatever's
+    focused at commit time (i.e. after the unmount) meant the frame's own
+    content was never evicted at all. add_tagged_turn tags each message
+    individually, so evict_frame can remove exactly the messages produced
+    while that frame had focus and leave the rest of the turn alone."""
+
+    def test_add_tagged_turn_basic_round_trip(self):
+        wb = ContextWorkbench()
+        wb.add_tagged_turn([(None, user("hi")), ("f1", assistant("mounted and worked"))])
+        assert wb.turns == [[user("hi"), assistant("mounted and worked")]]
+
+    def test_evict_frame_removes_only_the_tagged_messages_within_a_turn(self):
+        wb = ContextWorkbench()
+        wb.add_tagged_turn(
+            [
+                (None, user("diagnose it")),
+                (None, assistant("mounting the skill")),  # decision, made before the mount takes effect
+                ("f1", ChatMessage(role=ChatRole.TOOL, tool_call_id="c1", name="mount_skill", content="mounted")),
+                ("f1", ChatMessage(role=ChatRole.TOOL, tool_call_id="c2", name="run_command", content="did the work")),
+                (None, ChatMessage(role=ChatRole.TOOL, tool_call_id="c3", name="unmount_skill", content="unmounted")),
+                (None, assistant("all done")),
+            ]
+        )
+
+        evicted = wb.evict_frame("f1")
+
+        assert len(evicted) == 1
+        evicted_contents = [m.content for m in evicted[0]]
+        assert evicted_contents == ["mounted", "did the work"]
+        # everything NOT tagged to f1 survives, in its original order,
+        # even though it was in the same turn as the evicted messages
+        remaining_contents = [m.content for m in wb.turns[0]]
+        assert remaining_contents == ["diagnose it", "mounting the skill", "unmounted", "all done"]
+
+    def test_a_turn_fully_tagged_to_one_frame_is_removed_entirely(self):
+        wb = ContextWorkbench()
+        wb.add_tagged_turn([("f1", user("hi")), ("f1", assistant("bye"))])
+        wb.evict_frame("f1")
+        assert wb.turns == []
+
+    def test_add_turn_is_add_tagged_turn_with_one_frame_id_for_every_message(self):
+        """Backward-compatible convenience wrapper, still used wherever a
+        whole turn genuinely belongs to one frame (or none)."""
+        wb = ContextWorkbench()
+        wb.add_turn([user("a"), assistant("b")], frame_id="f1")
+        assert wb.evict_frame("f1") == [[user("a"), assistant("b")]]
+
+    def test_partial_eviction_still_fires_on_turn_evicted_with_just_the_evicted_messages(self):
+        evicted = []
+        wb = ContextWorkbench(on_turn_evicted=evicted.append)
+        wb.add_tagged_turn([(None, user("keep")), ("f1", assistant("evict me"))])
+
+        wb.evict_frame("f1")
+
+        assert len(evicted) == 1
+        assert [m.content for m in evicted[0]] == ["evict me"]
+
+    def test_turn_horizon_tokens_reflect_partial_eviction(self):
+        wb = ContextWorkbench()
+        wb.add_tagged_turn([(None, user("keep this")), ("f1", assistant("a rather long message to evict"))])
+        before = wb.turn_horizon_tokens
+        wb.evict_frame("f1")
+        after = wb.turn_horizon_tokens
+        assert after < before
+        assert after == count_tokens_of_message(user("keep this"))
+
+
+def count_tokens_of_message(message: ChatMessage) -> int:
+    from ftw.tokens import count_tokens
+
+    return count_tokens(message.content or "")
+
+
 class TestSnapshot:
     def test_snapshot_reports_each_zone(self):
         wb = ContextWorkbench(system_anchor="anchor text", user_memory="memory text")

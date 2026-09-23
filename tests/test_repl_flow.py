@@ -14,8 +14,8 @@ from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameTree
 from ftw.outputs import OutputStore
 from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse
-from ftw.protocol import AskEnvelope, AskPayload, CallEnvelope
-from ftw.repl.session import ReplSession, make_ask_answerer, make_confirm
+from ftw.protocol import AskEnvelope, AskPayload
+from ftw.repl.session import ReplSession, make_ask_answerer
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
 
@@ -210,34 +210,13 @@ class TestFramesCommand:
         assert "nothing mounted" in out.getvalue().lower()
 
 
-class TestMakeConfirm:
-    def _call(self) -> CallEnvelope:
-        from ftw.protocol import CallPayload
-
-        return CallEnvelope(
-            source="repl.master",
-            target="worker.tool.shell",
-            payload=CallPayload(action="run_command", args={"argv": ["rm", "-rf", "build"]}),
-        )
-
-    @pytest.mark.parametrize("answer,expected", [("y", True), ("yes", True), ("Y", True), ("n", False), ("", False), ("whatever", False)])
-    def test_confirm_reads_yes_no(self, answer, expected):
-        out = io.StringIO()
-        confirm = make_confirm(ScriptedInput([answer]), out)
-        assert confirm(self._call()) is expected
-        assert "run_command" in out.getvalue()
-
-    def test_confirm_fails_closed_on_eof(self):
-        confirm = make_confirm(ScriptedInput([]), io.StringIO())
-        assert confirm(self._call()) is False
-
-
 class TestMakeAskAnswerer:
-    """Answers a worker-initiated ASK (ftw_plan.md §4 "Mid-call
-    interaction") — distinct from make_confirm, which answers the
-    interceptor's pre-dispatch ASK. Used both for a worker asking
-    something directly and, identically from the REPL's point of view,
-    for a delegated run's own interceptor ASK relayed back as one."""
+    """The one callback that answers any question AgentLoop asks: the
+    interceptor's own pre-dispatch ASK (ftw_plan.md §3.4) and a
+    worker-initiated ASK (§4 "Mid-call interaction") alike. Used both for
+    a worker asking something directly and, identically from the REPL's
+    point of view, for a delegated run's own interceptor ASK relayed back
+    as one."""
 
     def _ask(self, question: str = "Overwrite build/CMakeCache.txt?") -> AskEnvelope:
         return AskEnvelope(
