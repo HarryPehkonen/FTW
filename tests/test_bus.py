@@ -262,6 +262,50 @@ class TestIpcTransport:
         assert not path.exists()
 
 
+class TestDispatchRouter:
+    """AgentLoop's `dispatch` contract is a single callable — but more than
+    one worker (the shell worker, the skill runner, ...) can be in play at
+    once, each bound to its own address. DispatchRouter is what lets one
+    `dispatch` callable still reach the right one, keyed by the envelope's
+    logical `target` name rather than a raw address."""
+
+    def test_routes_by_envelope_target_to_the_matching_requester(self, unique_name):
+        addr_a, addr_b = inproc_address(f"{unique_name}-a"), inproc_address(f"{unique_name}-b")
+        stop = threading.Event()
+
+        def handler_a(env):
+            return echo_handler(env)
+
+        def handler_b(env):
+            return ResultEnvelope(source="worker.b", target=env.source, payload=ResultPayload(status="ok", summary="from b"))
+
+        call_a = CallEnvelope(source="repl.master", target="worker.a", payload=CallPayload(action="run_command", args={"argv": ["echo", "hi"]}))
+        call_b = CallEnvelope(source="repl.master", target="worker.b", payload=CallPayload(action="run_command", args={"argv": ["echo", "hi"]}))
+
+        with Replier(addr_a) as rep_a, Replier(addr_b) as rep_b:
+            start_server(rep_a, handler_a, stop)
+            start_server(rep_b, handler_b, stop)
+            with Requester(addr_a) as req_a, Requester(addr_b) as req_b:
+                from ftw.bus import DispatchRouter
+
+                router = DispatchRouter({"worker.a": req_a, "worker.b": req_b})
+
+                reply_a = router(call_a)
+                reply_b = router(call_b)
+
+            assert reply_a.payload.summary == "handled"
+            assert reply_b.payload.summary == "from b"
+            stop.set()
+
+    def test_unknown_target_raises_a_clear_error(self, unique_name):
+        from ftw.bus import DispatchRouter
+
+        router = DispatchRouter({})
+        call = CallEnvelope(source="repl.master", target="worker.nope", payload=CallPayload(action="run_command", args={}))
+        with pytest.raises(KeyError, match="worker.nope"):
+            router(call)
+
+
 class TestPubSub:
     def make_event(self, topic: str) -> EventEnvelope:
         return EventEnvelope(

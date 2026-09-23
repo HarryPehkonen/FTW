@@ -7,9 +7,12 @@ network calls and zero live LLM tokens: the model side is MockModelProvider.
 """
 
 import io
+import json
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -186,3 +189,112 @@ class TestPhase2Deliverable:
         by_name = {z.name: z for z in snapshot.zones}
         assert by_name["Mounted Skill"].tokens == 0
         assert by_name["Milestones"].detail == "1 milestone(s)"
+
+
+def openai_tool_call_response(name: str, arguments: dict, call_id: str = "c1") -> dict:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}],
+                }
+            }
+        ]
+    }
+
+
+def openai_text_response(text: str) -> dict:
+    return {"choices": [{"message": {"role": "assistant", "content": text}}]}
+
+
+class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
+    """A minimal local stand-in for an OpenAI-compatible /chat/completions
+    endpoint — fully local and scripted, not a real provider, so this
+    still respects "no live LLM tokens." It's what lets the skill-runner
+    *subprocess* (which resolves a real OpenAICompatibleProvider from
+    ftw.toml, since MockModelProvider can't cross a process boundary)
+    actually get a deterministic answer."""
+
+    responses: list[dict] = []
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's naming convention
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        body = json.dumps(self.responses.pop(0)).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):  # noqa: A002 - silence per-request logging in test output
+        pass
+
+
+def start_mock_model_server(responses: list[dict]) -> HTTPServer:
+    handler_cls = type("_Handler", (_ScriptedOpenAIHandler,), {"responses": list(responses)})
+    server = HTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+class TestDelegatedSkillRealSubprocess:
+    """ftw_plan.md §8 Phase 3 deliverable: "A mounted skill or the REPL
+    delegates a sub-task; caller context grows only by the Result." Proven
+    against a real skill-runner subprocess talking to a real (if scripted
+    and local) HTTP endpoint for its own model calls — the one boundary
+    other Phase 3 tests can't cross, since MockModelProvider can't be
+    handed to a separate process."""
+
+    def test_delegate_skill_across_a_real_subprocess_boundary(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        write_skill(skills_dir, "toolchain/verify_installed", "toolchain.verify_installed", "Verify a compiler toolchain is installed.")
+
+        server = start_mock_model_server(
+            [openai_tool_call_response("submit_result", {"status": "ok", "summary": "gcc 13 is installed and on PATH."})]
+        )
+        try:
+            config_path = tmp_path / "ftw.toml"
+            config_path.write_text(
+                f"""
+                [providers.mock_http]
+                kind = "openai_compatible"
+                base_url = "http://127.0.0.1:{server.server_port}/v1"
+
+                [tiers.fast]
+                provider = "mock_http"
+                model = "mock-model"
+                """
+            )
+
+            main_provider = MockModelProvider(
+                [
+                    tool_call_response("delegate_skill", {"name": "toolchain.verify_installed", "brief": "check gcc"}, "d1"),
+                    text_response("Confirmed: gcc 13 is installed and on PATH."),
+                ]
+            )
+            out = io.StringIO()
+            handle = build_repl_session(
+                ftw_home=tmp_path,
+                skills_dir=skills_dir,
+                config_path=config_path,
+                provider=main_provider,
+                input_fn=ScriptedInput([]),
+                output=out,
+            )
+            workbench = handle.session.agent_loop.workbench
+            try:
+                reply = handle.session.agent_loop.run_turn("is gcc installed?")
+            finally:
+                handle.close()
+        finally:
+            server.shutdown()
+
+        assert reply == "Confirmed: gcc 13 is installed and on PATH."
+        # the caller's context grew by exactly one tool message: the
+        # delegated run's structured summary, nothing about its internals
+        tool_messages = [m for m in workbench.turns[0] if m.role == ChatRole.TOOL]
+        assert len(tool_messages) == 1
+        assert "gcc 13 is installed" in tool_messages[0].content

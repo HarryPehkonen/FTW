@@ -14,7 +14,16 @@ from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameTree
 from ftw.intercept import ConfirmShellCommands, InterceptDecision, InterceptOutcome, PreCommitInterceptor
 from ftw.outputs import OutputStore
-from ftw.protocol import CallEnvelope, ErrorEnvelope, ErrorPayload, ResultEnvelope, ResultPayload
+from ftw.protocol import (
+    AnswerEnvelope,
+    AskEnvelope,
+    AskPayload,
+    CallEnvelope,
+    ErrorEnvelope,
+    ErrorPayload,
+    ResultEnvelope,
+    ResultPayload,
+)
 from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
@@ -354,6 +363,61 @@ def write_skill(root, relpath: str, name: str, description: str, body: str = "do
     path.write_text(f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n")
 
 
+class TestDelegateSkillTool:
+    """delegate_skill (ftw_plan.md §3.2 Mode A): dispatched like any other
+    bus tool — the caller's context grows only by the RESULT's summary,
+    since that's all _reply_to_content ever extracts from a ResultEnvelope."""
+
+    def test_delegate_skill_only_registered_when_target_given(self, tmp_path):
+        with_target = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider([]),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+            skill_runner_target="skill.runner",
+        )
+        assert "delegate_skill" in {t.name for t in with_target._tool_specs}  # noqa: SLF001
+
+        without_target = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider([]),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+        )
+        assert "delegate_skill" not in {t.name for t in without_target._tool_specs}  # noqa: SLF001
+
+    def test_delegate_skill_dispatches_to_the_configured_target_and_returns_the_summary(self, tmp_path):
+        result_reply = ResultEnvelope(
+            source="skill.runner",
+            target="repl.master",
+            payload=ResultPayload(status="ok", summary="Diagnosed and fixed the CMake issue.", outputs={"patch_applied": True}),
+        )
+        dispatcher = RecordingDispatcher([result_reply])
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider(
+                [
+                    assistant_tool_call("delegate_skill", {"name": "cmake.diagnose_configure", "brief": "fix the build"}),
+                    assistant_text("the sub-task finished"),
+                ]
+            ),
+            output_store=OutputStore(tmp_path),
+            dispatch=dispatcher,
+            interceptor=PreCommitInterceptor([]),
+            skill_runner_target="skill.runner",
+        )
+
+        assert loop.run_turn("delegate this") == "the sub-task finished"
+        assert len(dispatcher.calls) == 1
+        assert dispatcher.calls[0].payload.action == "delegate_skill"
+        assert dispatcher.calls[0].target == "skill.runner"
+        # the caller's own turn holds only the summary text, never the
+        # delegated run's internal steps
+        tool_messages = [m for m in loop.workbench.turns[0] if m.role == ChatRole.TOOL]
+        assert len(tool_messages) == 1
+        assert "Diagnosed and fixed" in tool_messages[0].content
+
+
 class TestFrameToolsIntegration:
     """find_skill/mount_skill/unmount_skill (ftw_plan.md §3.2
     "Self-Mounting"): local execution (no bus dispatch) but still routed
@@ -507,3 +571,157 @@ class TestErrorReply:
         )
 
         assert loop.run_turn("run nope") == "that file doesn't exist"
+
+
+def submit_result_call(status="ok", summary="done", outputs=None, evidence=None, call_id="s1") -> ProviderResponse:
+    args = {"status": status, "summary": summary}
+    if outputs is not None:
+        args["outputs"] = outputs
+    if evidence is not None:
+        args["evidence"] = evidence
+    return assistant_tool_call("submit_result", args, call_id=call_id)
+
+
+class TestRunDelegated:
+    """The delegated skill runner (ftw_plan.md §3.2 Mode A, §8 Phase 3): a
+    fresh, isolated AgentLoop runs a skill to completion and produces one
+    structured Result — the caller's own context never absorbs the
+    delegated run's intermediate tool calls or deliberation."""
+
+    def make_delegated_loop(self, tmp_path, responses, **kwargs):
+        return AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider(responses),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError("must not dispatch")),
+            enable_delegated_completion=True,
+            **kwargs,
+        )
+
+    def test_submit_result_produces_a_result_payload(self, tmp_path):
+        loop = self.make_delegated_loop(
+            tmp_path,
+            [submit_result_call(summary="Identified missing OpenSSL headers.", outputs={"patch_applied": True}, evidence=["grep -i openssl log"])],
+        )
+
+        result = loop.run_delegated("diagnose the cmake failure")
+
+        assert isinstance(result, ResultPayload)
+        assert result.status == "ok"
+        assert result.summary == "Identified missing OpenSSL headers."
+        assert result.outputs == {"patch_applied": True}
+        assert result.evidence == ["grep -i openssl log"]
+        assert "wall_time_ms" in result.cost
+
+    def test_error_status_is_preserved(self, tmp_path):
+        loop = self.make_delegated_loop(tmp_path, [submit_result_call(status="error", summary="could not reproduce")])
+        result = loop.run_delegated("diagnose it")
+        assert result.status == "error"
+        assert result.summary == "could not reproduce"
+
+    def test_tool_calls_before_submit_result_are_handled_normally(self, tmp_path):
+        loop = self.make_delegated_loop(
+            tmp_path,
+            [
+                assistant_tool_call("pin", {"key": "finding", "value": "missing openssl"}),
+                submit_result_call(summary="done"),
+            ],
+        )
+        result = loop.run_delegated("diagnose it")
+        assert result.status == "ok"
+        assert loop.workbench.scratchpad == {"finding": "missing openssl"}  # ordinary tool handling still applies
+
+    def test_plain_text_without_submit_result_is_a_forgiving_fallback(self, tmp_path):
+        loop = self.make_delegated_loop(tmp_path, [assistant_text("I looked and everything's fine.")])
+        result = loop.run_delegated("check it")
+        assert result.status == "ok"
+        assert result.summary == "I looked and everything's fine."
+
+    def test_step_budget_exceeded_without_submit_result_is_an_error_result(self, tmp_path):
+        responses = [assistant_tool_call("pin", {"key": "k", "value": "v"}, call_id=f"c{i}") for i in range(3)]
+        loop = self.make_delegated_loop(tmp_path, responses, max_steps=3)
+        result = loop.run_delegated("loop forever")
+        assert result.status == "error"
+        assert "budget" in result.summary.lower()
+
+    def test_run_delegated_without_enable_flag_raises(self, tmp_path):
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider([]),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+        )
+        with pytest.raises(RuntimeError):
+            loop.run_delegated("anything")
+
+    def test_submit_result_tool_only_appears_when_enabled(self, tmp_path):
+        delegated = self.make_delegated_loop(tmp_path, [submit_result_call()])
+        assert "submit_result" in {t.name for t in delegated._tool_specs}  # noqa: SLF001 - whitebox
+
+        interactive = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider([]),
+            output_store=OutputStore(tmp_path),
+            dispatch=lambda call: (_ for _ in ()).throw(AssertionError()),
+        )
+        assert "submit_result" not in {t.name for t in interactive._tool_specs}  # noqa: SLF001
+
+
+class TestWorkerInitiatedAskRelay:
+    """A worker mid-computation can reply ASK instead of RESULT/ERROR
+    (ftw_plan.md §4 "Mid-call interaction"). Distinct from the
+    interceptor's own ASK decision (already covered above): here the
+    *worker itself*, not the interceptor, needs an answer before it can
+    finish. Relayed over the same dispatch/target — a worker's ANSWER
+    reply-address is the same address its CALL went to."""
+
+    def test_answers_and_redispatches_until_a_result(self, tmp_path):
+        ask = AskEnvelope(
+            source="worker.tool.shell", target="repl.master", payload=AskPayload(question="Overwrite existing file?", resume_token="tok-1")
+        )
+        result = ResultEnvelope(source="worker.tool.shell", target="repl.master", payload=ResultPayload(status="ok", summary="overwrote it"))
+        dispatcher = RecordingDispatcher([ask, result])
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["cp", "a", "b"]}), assistant_text("done")],
+            dispatch=dispatcher,
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+
+        assert loop.run_turn("copy a to b") == "done"
+        assert len(dispatcher.calls) == 2
+
+        answer_call = dispatcher.calls[1]
+        assert isinstance(answer_call, AnswerEnvelope)
+        assert answer_call.payload.resume_token == "tok-1"
+        assert answer_call.payload.value is False  # default ask_answerer fails closed
+
+    def test_custom_ask_answerer_supplies_the_answer_value(self, tmp_path):
+        ask = AskEnvelope(source="w", target="repl.master", payload=AskPayload(question="proceed?", resume_token="tok-2"))
+        result = ResultEnvelope(source="w", target="repl.master", payload=ResultPayload(status="ok", summary="proceeded"))
+        dispatcher = RecordingDispatcher([ask, result])
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider([assistant_tool_call("run_command", {"argv": ["x"]}), assistant_text("ok")]),
+            output_store=OutputStore(tmp_path),
+            dispatch=dispatcher,
+            interceptor=PreCommitInterceptor([]),
+            ask_answerer=lambda ask_env: "yes please",
+        )
+        loop.run_turn("go")
+
+        answer_call = dispatcher.calls[1]
+        assert isinstance(answer_call, AnswerEnvelope)
+        assert answer_call.payload.value == "yes please"
+
+    def test_bounded_rounds_prevents_an_infinite_ask_loop(self, tmp_path):
+        always_ask = AskEnvelope(source="w", target="repl.master", payload=AskPayload(question="again?", resume_token="tok-3"))
+        dispatcher = RecordingDispatcher([always_ask] * 50)  # more than the round cap
+        loop = make_loop(
+            responses=[assistant_tool_call("run_command", {"argv": ["x"]}), assistant_text("gave up")],
+            dispatch=dispatcher,
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+        assert loop.run_turn("go") == "gave up"
+        assert len(dispatcher.calls) < 50  # bailed out well before exhausting the script

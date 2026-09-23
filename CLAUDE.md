@@ -10,10 +10,16 @@ into that context and **unmounted** to free the space, and workers that talk
 over an NNG message bus. The design lives in `ftw_plan.md`; read it before
 making architectural changes.
 
-**Status:** Phase 0 (protocol + bus + runtime dir), Phase 1 (providers,
-workbench, agent loop, shell worker, interceptor, REPL), and Phase 2 (skills
-and mounted frames — the headline feature) are done. Phase 3 (delegated
-sub-agent skill runs) is next. See §8 of `ftw_plan.md` for the phase list.
+**Status:** Phase 0, Phase 1, and Phase 2 (skills and mounted frames — the
+headline feature) are done. Phase 3 (delegated sub-agent skill runs) is
+partially done: a skill can run as an isolated sub-task in its own
+subprocess with a fresh, isolated workbench, and the caller's context grows
+only by its structured `Result` (`delegate_skill`, driven by
+`AgentLoop.run_delegated` + `skills/runner.py`). Not yet built: a delegated
+run's own interceptor decisions default to an empty (always-allow) policy —
+there's no local human at that process to ask, and relaying an `ASK` back
+through the caller to a real human mid-run is the natural next slice, along
+with `CANCEL` on Ctrl-C. See §8 of `ftw_plan.md` for the phase list.
 
 Run it: `uv run ftw` (needs a real key for the `fast`/`smart` tiers in
 `ftw.toml` — `DEEPSEEK_API_KEY` / `NOUS_API_KEY`). Point `--skills-dir` at

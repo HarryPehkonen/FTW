@@ -52,6 +52,16 @@ Shell commands the model proposes are confirmed with you before they run.
 The prompt supports normal line editing and history (arrow keys, `Ctrl-R`
 search) on POSIX systems.
 
+## Delegating a sub-task
+
+The model can hand a bounded task to a skill with `delegate_skill(name,
+brief, inputs)`. That skill runs to completion in its own process with its
+own fresh context — none of its intermediate steps ever reach the current
+conversation, only a short structured result (a summary, plus any
+outputs/evidence it reports) comes back. This is the tool to reach for when
+a task is well-scoped enough to run unsupervised rather than worked through
+turn by turn.
+
 ## Skills
 
 A skill is a directory containing a `SKILL.md`: YAML frontmatter (name,
@@ -93,9 +103,9 @@ src/ftw/
 ├── tokens.py              the canonical, provider-independent token counter
 ├── workbench.py           the Context Workbench: budgeted zones, prompt rendering
 ├── frames.py              the mounted-skill frame tree: nesting, focus, subtree eviction, milestones
-├── skills/                SKILL.md parsing, the size lint, and the skill store (find_skill via BM25)
+├── skills/                SKILL.md parsing, the size lint, the skill store (find_skill via BM25), and the delegated-run worker (runner.py)
 ├── outputs.py             out-of-band tool-output store (read_output/grep_output handles)
-├── agent_loop.py          model -> interceptor -> bus -> result cycle
+├── agent_loop.py          model -> interceptor -> bus -> result cycle; also drives delegated (sub-task) completions
 ├── intercept/             Pre-Commit Interceptor pipeline
 ├── providers/             IModelProvider, MockModelProvider, OpenAICompatibleProvider
 ├── tools/shell.py         the shell tool worker, as an independent NNG service

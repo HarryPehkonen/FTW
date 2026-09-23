@@ -226,6 +226,27 @@ class Replier:
         self.close()
 
 
+class DispatchRouter:
+    """Routes an envelope to the Requester bound to its ``target``.
+
+    A caller like AgentLoop takes a single ``dispatch`` callable, but more
+    than one worker (the shell worker, the delegated skill runner, ...)
+    can be in play in the same session, each bound to its own address.
+    This is what lets one callable still reach the right one, keyed by the
+    envelope's logical target name rather than a raw address — the same
+    role ``tool_targets`` plays in labeling a CallEnvelope, just followed
+    through to an actual socket."""
+
+    def __init__(self, requesters: dict[str, Requester]):
+        self._requesters = requesters
+
+    def __call__(self, envelope: AnyEnvelope) -> AnyEnvelope:
+        requester = self._requesters.get(envelope.target)
+        if requester is None:
+            raise KeyError(f"no requester configured for target {envelope.target!r} (known: {sorted(self._requesters)})")
+        return requester.call(envelope)
+
+
 class Publisher:
     """PUB socket. Sends are fire-and-forget: with no subscriber connected,
     NNG discards the message immediately rather than blocking."""

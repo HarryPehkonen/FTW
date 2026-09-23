@@ -19,7 +19,7 @@ from typing import TextIO
 from uuid import uuid4
 
 from ftw.agent_loop import AgentLoop
-from ftw.bus import Publisher, Requester
+from ftw.bus import DispatchRouter, Publisher, Requester
 from ftw.config import build_provider, load_config
 from ftw.frames import FrameTree, make_llm_summarizer
 from ftw.intercept import ConfirmShellCommands, PreCommitInterceptor
@@ -47,6 +47,12 @@ DEFAULT_SYSTEM_ANCHOR = "You are FTW, a local-first agent. Be terse and safe."
 DEFAULT_WORKER_STARTUP_GRACE_S = 0.5
 _WORKER_POLL_INTERVAL_S = 0.02
 
+# Logical target names, as recorded in a CallEnvelope's `target` field and
+# looked up by DispatchRouter — not the actual dynamic ipc:// address,
+# which changes on every run.
+SHELL_WORKER_TARGET = "worker.tool.shell"  # matches agent_loop.DEFAULT_TOOL_TARGETS
+SKILL_RUNNER_TARGET = "skill.runner"
+
 
 class WorkerStartupError(Exception):
     pass
@@ -58,13 +64,41 @@ def spawn_shell_worker(address: str, output_root: Path) -> subprocess.Popen:
     )
 
 
-def _wait_for_worker_or_crash(proc: subprocess.Popen, *, grace_s: float) -> None:
+def spawn_skill_runner_worker(
+    address: str,
+    *,
+    skills_dir: Path,
+    output_root: Path,
+    shell_worker_address: str,
+    config_path: Path,
+    default_tier: str,
+) -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "ftw.skills.runner",
+            "--address",
+            address,
+            "--skills-dir",
+            str(skills_dir),
+            "--output-root",
+            str(output_root),
+            "--shell-worker-address",
+            shell_worker_address,
+            "--config",
+            str(config_path),
+            "--default-tier",
+            default_tier,
+        ],
+    )
+
+
+def _wait_for_worker_or_crash(proc: subprocess.Popen, *, grace_s: float, name: str = "worker") -> None:
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise WorkerStartupError(
-                f"shell worker exited during startup (exit code {proc.returncode}); see its output above"
-            )
+            raise WorkerStartupError(f"{name} exited during startup (exit code {proc.returncode}); see its output above")
         time.sleep(_WORKER_POLL_INTERVAL_S)
 
 
@@ -79,22 +113,30 @@ def _enable_readline() -> bool:
     return True
 
 
+def _stop_worker(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
 @dataclass
 class ReplHandle:
     session: ReplSession
-    _worker_proc: subprocess.Popen
-    _requester: Requester
+    _shell_worker_proc: subprocess.Popen
+    _shell_requester: Requester
+    _skill_runner_proc: subprocess.Popen
+    _skill_runner_requester: Requester
     _publisher: Publisher
 
     def close(self) -> None:
-        self._requester.close()
+        self._shell_requester.close()
+        self._skill_runner_requester.close()
         self._publisher.close()
-        self._worker_proc.terminate()
-        try:
-            self._worker_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._worker_proc.kill()
-            self._worker_proc.wait(timeout=5)
+        _stop_worker(self._shell_worker_proc)
+        _stop_worker(self._skill_runner_proc)
 
 
 def build_repl_session(
@@ -108,6 +150,7 @@ def build_repl_session(
     system_anchor: str = DEFAULT_SYSTEM_ANCHOR,
     skills_dir: Path | None = None,
     worker_address: str | None = None,
+    skill_runner_address: str | None = None,
     worker_startup_grace_s: float = DEFAULT_WORKER_STARTUP_GRACE_S,
 ) -> ReplHandle:
     ftw_home = Path(ftw_home)
@@ -119,10 +162,25 @@ def build_repl_session(
         config = load_config(config_path or Path("ftw.toml"))
         provider = build_provider(config, tier)
 
-    worker_address = worker_address or ipc_address(f"worker.tool.shell.{uuid4().hex[:8]}")
-    worker_proc = spawn_shell_worker(worker_address, output_root)
-    _wait_for_worker_or_crash(worker_proc, grace_s=worker_startup_grace_s)
-    requester = Requester(worker_address)
+    resolved_skills_dir = skills_dir or (ftw_home / "skills")
+    resolved_config_path = config_path or Path("ftw.toml")
+
+    shell_worker_address = worker_address or ipc_address(f"worker.tool.shell.{uuid4().hex[:8]}")
+    shell_worker_proc = spawn_shell_worker(shell_worker_address, output_root)
+    _wait_for_worker_or_crash(shell_worker_proc, grace_s=worker_startup_grace_s, name="shell worker")
+    shell_requester = Requester(shell_worker_address)
+
+    skill_runner_address = skill_runner_address or ipc_address(f"skill.runner.{uuid4().hex[:8]}")
+    skill_runner_proc = spawn_skill_runner_worker(
+        skill_runner_address,
+        skills_dir=resolved_skills_dir,
+        output_root=output_root,
+        shell_worker_address=shell_worker_address,
+        config_path=resolved_config_path,
+        default_tier=tier,
+    )
+    _wait_for_worker_or_crash(skill_runner_proc, grace_s=worker_startup_grace_s, name="skill runner")
+    skill_runner_requester = Requester(skill_runner_address)
 
     trace_writer = TraceWriter(traces_root)
     publisher = Publisher(ipc_address(f"events.{uuid4().hex[:8]}"))
@@ -132,22 +190,32 @@ def build_repl_session(
         publisher.publish(evt)
 
     workbench = ContextWorkbench(system_anchor=system_anchor)
-    skill_store = SkillStore(skills_dir or (ftw_home / "skills"))
+    skill_store = SkillStore(resolved_skills_dir)
     frame_tree = FrameTree(workbench, skill_store, summarizer=make_llm_summarizer(provider))
+
+    dispatch = DispatchRouter({SHELL_WORKER_TARGET: shell_requester, SKILL_RUNNER_TARGET: skill_runner_requester})
 
     loop = AgentLoop(
         workbench=workbench,
         provider=provider,
         output_store=OutputStore(output_root),
-        dispatch=requester.call,
+        dispatch=dispatch,
         interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
         confirm=make_confirm(input_fn, output),
         frame_tree=frame_tree,
+        skill_runner_target=SKILL_RUNNER_TARGET,
         on_event=on_event,
     )
     session = ReplSession(agent_loop=loop, input_fn=input_fn, output=output)
 
-    return ReplHandle(session=session, _worker_proc=worker_proc, _requester=requester, _publisher=publisher)
+    return ReplHandle(
+        session=session,
+        _shell_worker_proc=shell_worker_proc,
+        _shell_requester=shell_requester,
+        _skill_runner_proc=skill_runner_proc,
+        _skill_runner_requester=skill_runner_requester,
+        _publisher=publisher,
+    )
 
 
 def _run_repl(args: argparse.Namespace) -> None:
@@ -178,10 +246,19 @@ def main(argv: list[str] | None = None) -> None:
         shell_worker_main(argv[1:])
         return
 
+    if argv[:1] == ["skill-runner"]:
+        from ftw.skills.runner import main as skill_runner_main
+
+        skill_runner_main(argv[1:])
+        return
+
     parser = argparse.ArgumentParser(
         prog="ftw",
         description="FTW REPL",
-        epilog="Other subcommands: 'ftw tap' (stream live events), 'ftw shell-worker' (run the shell worker standalone).",
+        epilog=(
+            "Other subcommands: 'ftw tap' (stream live events), 'ftw shell-worker' "
+            "(run the shell worker standalone), 'ftw skill-runner' (run the delegated skill worker standalone)."
+        ),
     )
     parser.add_argument("--config", default="ftw.toml")
     parser.add_argument("--tier", default="fast")
