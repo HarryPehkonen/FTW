@@ -1,25 +1,43 @@
 """The agent loop: model -> interceptor -> bus -> result cycle
 (ftw_plan.md §3.4).
 
-This is the one place that cycle is implemented, as a single shared
-generator (``_step_loop``) driven differently by interactive and
-delegated modes:
+This is the one place that cycle is implemented. Everything here is async
+(see bus.py's module docstring for why the whole call chain moved to
+asyncio): the model call, the bus dispatch, and — for a delegated run that
+needs to suspend across a completely separate incoming request — the
+suspend/resume mechanism itself.
 
-* ``run_turn`` (interactive) drives it synchronously — every question the
-  generator ``yield``s is answered immediately via ``ask_answerer``, in
-  the same call, and the final ``ResultPayload.summary`` becomes the chat
-  reply.
+``_step_loop`` is a plain coroutine, not an async generator: PEP 525
+forbids ``return <value>`` inside an async generator, which would have
+broken the old synchronous generator's "yield an AskEnvelope, return the
+final ResultPayload via StopIteration.value" design. Instead, an ``ask``
+callable is injected, and every question that used to be a
+``yield AskEnvelope(...)`` is now ``await ask(envelope)``:
+
+* ``run_turn`` (interactive) drives it synchronously from the caller's
+  point of view — ``ask`` is bound directly to ``self._ask_answerer``, an
+  ordinary ``await``, no suspension needed. The final ``return payload``
+  works normally, since this is just a coroutine.
 * ``run_delegated``/``resume_delegated`` (Mode A, ftw_plan.md §3.2, §8
-  Phase 3) drive it by *suspending*: the first question yielded is handed
-  back to the caller as a :class:`DelegatedSuspension` instead of being
-  answered, and the paused generator itself — Python's own machinery, not
-  a hand-rolled state machine — holds everything needed to resume later,
-  including from a completely different call, in a different process's
-  request handler (``skills/runner.py`` stashes it by resume_token). No
+  Phase 3) drive it by *suspending*: ``ask`` is bound to a small internal
+  ``_Asker`` object whose ``ask()`` creates an ``asyncio.Future``, records
+  the pending question, and awaits that future — genuinely suspending the
+  coroutine until something *outside* resolves it. The coroutine is
+  wrapped in an ``asyncio.Task`` and raced against "the asker produced a
+  pending question" via ``asyncio.wait(FIRST_COMPLETED)``: if the task
+  finishes first, its result is the ``ResultPayload``; otherwise the first
+  question is handed back as a :class:`DelegatedSuspension` carrying the
+  still-running (now suspended) Task and its Asker — the paused Task
+  itself, Python's own machinery, holds everything needed to resume later,
+  including from a completely different call, in a different request
+  handler (``skills/runner.py`` stashes it by resume_token). Resolving a
+  Future/awaiting a Task from a different coroutine than the one that
+  created it is safe and standard as long as both run on the same event
+  loop — true by construction here (one ``asyncio.run()`` per process). No
   local human is needed to answer a delegated run's own interceptor ASK;
-  it surfaces to whoever's driving the run exactly like a worker's own
-  ASK does (see below) — the same mechanism serves both, so nothing
-  extra was needed to support it.
+  it surfaces to whoever's driving the run exactly like a worker's own ASK
+  does (see below) — the same mechanism serves both, so nothing extra was
+  needed to support it.
 
 Three kinds of tool call a model can make, handled differently on purpose:
 
@@ -30,19 +48,19 @@ Three kinds of tool call a model can make, handled differently on purpose:
   ``_step_loop`` rather than as a local tool, since it ends the run.
 * **Intercepted calls** — go through
   :class:`~ftw.intercept.PreCommitInterceptor` first. ``ALLOW`` executes
-  immediately; ``ASK`` yields an ``AskEnvelope`` (carrying the actual
-  action and arguments, not just the interceptor's reason) and only
-  executes if the answer is exactly ``True``; ``BLOCK`` never executes
-  and never asks. Two flavors:
+  immediately; ``ASK`` awaits an answer (carrying the actual action and
+  arguments, not just the interceptor's reason) and only executes if the
+  answer is exactly ``True``; ``BLOCK`` never executes and never asks. Two
+  flavors:
   - **Bus tools** (``run_command``, ``delegate_skill``) dispatched as a
     CALL over the bus, with a deadline comfortably longer than whatever
     they wrap (see ``DEFAULT_CALL_DEADLINES_MS``) — a ``DeadlineExceeded``
-    or a Ctrl-C ``KeyboardInterrupt`` during dispatch is reported back as
-    a tool result, not left to crash the turn. If the worker itself
-    replies ``ASK`` (not the interceptor — the worker mid-computation
-    needing an answer, ftw_plan.md §4 "Mid-call interaction"), that's
-    yielded too and redispatched once answered, looping until a
-    ``RESULT``/``ERROR`` or a round cap.
+    or a real Ctrl-C (``asyncio.CancelledError``) during dispatch is
+    reported back as a tool result, not left to crash the turn. If the
+    worker itself replies ``ASK`` (not the interceptor — the worker
+    mid-computation needing an answer, ftw_plan.md §4 "Mid-call
+    interaction"), that's awaited too and redispatched once answered,
+    looping until a ``RESULT``/``ERROR`` or a round cap.
   - **Frame tools** (``find_skill``, ``mount_skill``, ``unmount_skill`` —
     ftw_plan.md §3.2 "Self-Mounting") execute locally against the shared
     :class:`~ftw.frames.FrameTree` instead of over the bus, since mounting
@@ -67,19 +85,23 @@ what makes the mount/unmount invariant hold even when a model mounts,
 works, and unmounts all within a single reply — its natural self-mount
 pattern, not just the two-separate-turns case.
 
-**Cooperative cancellation** (``cancel_flag``): checked between steps of
-a delegated run, since a blocked ``provider.complete()`` call can't be
-preempted. Set by ``skills/runner.py`` in response to a ``CANCEL`` on its
-control channel; captured once, in the generator's own closure, when the
-run starts — a resume doesn't need it re-supplied.
+**Cooperative cancellation** (``cancel_flag``): checked between steps of a
+delegated run, and immediately after any ``await ask(...)`` resumes (not
+just at the top of each step) — a suspended ask resumes mid-tool-call,
+well past the per-step check, so a cancel arriving while suspended would
+otherwise only be noticed one whole step too late. Set by
+``skills/runner.py`` in response to a ``CANCEL`` on its control channel;
+captured once, in the running Task's own closure, when the run starts — a
+resume doesn't need it re-supplied.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Generator
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from ftw.bus import DeadlineExceeded
@@ -107,13 +129,12 @@ from ftw.skills.manifest import SkillParseError
 from ftw.skills.registry import SkillNotFound
 from ftw.workbench import ContextWorkbench, WorkbenchBudgetExceeded
 
-Dispatch = Callable[[AnyEnvelope], AnyEnvelope]  # a CallEnvelope, or an AnswerEnvelope relaying a worker's ASK
-AskAnswerer = Callable[[AskEnvelope], Any]
+Ask = Callable[[AskEnvelope], Awaitable[Any]]  # answers a question the loop is asking, mid-run
+Dispatch = Callable[[AnyEnvelope], Awaitable[AnyEnvelope]]  # a CallEnvelope, or an AnswerEnvelope relaying a worker's ASK
+AskAnswerer = Callable[[AskEnvelope], Awaitable[Any]]
 EventSink = Callable[[EventEnvelope], None]
-LocalToolHandler = Callable[[dict[str, Any]], str]
+LocalToolHandler = Callable[[dict[str, Any]], Awaitable[str]]
 CancelFlag = Any  # duck-typed: anything with a no-arg is_set() -> bool, e.g. threading.Event
-StepGenerator = Generator[AskEnvelope, Any, ResultPayload]
-ToolCallGenerator = Generator[AskEnvelope, Any, str]
 
 MAX_WORKER_ASK_ROUNDS = 10
 
@@ -129,15 +150,46 @@ DEFAULT_CALL_DEADLINES_MS: dict[str, int] = {
 FALLBACK_CALL_DEADLINE_MS = 30_000
 
 
+class _Asker:
+    """One-shot-per-question, reusable-across-rounds: ``ask()`` is awaited
+    from inside the running ``_step_loop`` Task; ``answer()`` is called
+    from outside, by whoever is driving the delegated run — possibly a
+    different Task than the one that created this ``_Asker`` (see the
+    module docstring). ``_ask_seen`` is an ``asyncio.Event``, not a
+    one-shot ``Future``: a single delegated run can ask multiple questions
+    across its lifetime, so the "a new question showed up" signal has to
+    be re-armable — ``answer()`` clears it before resuming the Task, so
+    the next wait doesn't immediately see a stale, already-set signal left
+    over from the previous round (a real bug caught in an isolated
+    throwaway check of this exact design before it was wired in here)."""
+
+    def __init__(self) -> None:
+        self.pending: AskEnvelope | None = None
+        self._ask_seen = asyncio.Event()
+        self._answer: asyncio.Future | None = None
+
+    async def ask(self, envelope: AskEnvelope) -> Any:
+        self.pending = envelope
+        self._answer = asyncio.get_running_loop().create_future()
+        self._ask_seen.set()
+        return await self._answer
+
+    def answer(self, value: Any) -> None:
+        self._ask_seen.clear()
+        self._answer.set_result(value)
+
+
 @dataclass
 class DelegatedSuspension:
     """Returned by run_delegated/resume_delegated in place of a
     ResultPayload when the run needs external input before it can
     continue. ``ask`` is the only part meant to be read by the caller —
-    the paused generator itself carries the rest of the state."""
+    the still-running (suspended) Task and its Asker carry the rest of
+    the state."""
 
     ask: AskEnvelope
-    _generator: StepGenerator
+    _task: "asyncio.Task[ResultPayload]"
+    _asker: _Asker
     _cancel_flag: CancelFlag | None = None
 
 
@@ -292,7 +344,7 @@ class AgentLoop:
         self._outputs = output_store
         self._dispatch = dispatch
         self._interceptor = interceptor or PreCommitInterceptor([])
-        self._ask_answerer: AskAnswerer = ask_answerer or (lambda ask: False)  # fail closed
+        self._ask_answerer: AskAnswerer = ask_answerer or self._deny_everything  # fail closed
         self._control_dispatch = control_dispatch
         self._tool_specs = list(BUILTIN_TOOL_SPECS) + list(extra_tool_specs or [])
         self._tool_targets = {**DEFAULT_TOOL_TARGETS, **(tool_targets or {})}
@@ -324,20 +376,17 @@ class AgentLoop:
                 "unmount_skill": self._handle_unmount_skill,
             }
 
+    @staticmethod
+    async def _deny_everything(ask: AskEnvelope) -> bool:
+        return False
+
     # -- public entry points --------------------------------------------
 
-    def run_turn(self, user_input: str) -> str:
-        gen = self._step_loop(ChatMessage(role=ChatRole.USER, content=user_input))
-        answer: Any = None
-        while True:
-            try:
-                ask = gen.send(answer)
-            except StopIteration as stop:
-                result: ResultPayload = stop.value
-                return result.summary
-            answer = self._ask_answerer(ask)
+    async def run_turn(self, user_input: str) -> str:
+        result = await self._step_loop(ChatMessage(role=ChatRole.USER, content=user_input), ask=self._ask_answerer)
+        return result.summary
 
-    def run_delegated(self, brief: str, *, cancel_flag: CancelFlag | None = None) -> ResultPayload | DelegatedSuspension:
+    async def run_delegated(self, brief: str, *, cancel_flag: CancelFlag | None = None) -> ResultPayload | DelegatedSuspension:
         """Runs to a structured completion instead of a chat reply — the
         model must call submit_result to finish. Only meaningful on an
         AgentLoop built with enable_delegated_completion=True and, in
@@ -348,29 +397,34 @@ class AgentLoop:
         resume_delegated once one arrives."""
         if not self._delegated_enabled:
             raise RuntimeError("this AgentLoop wasn't constructed with enable_delegated_completion=True")
-        gen = self._step_loop(ChatMessage(role=ChatRole.USER, content=brief), cancel_flag=cancel_flag)
-        return self._drive_delegated(gen, None, cancel_flag=cancel_flag)
+        asker = _Asker()
+        task = asyncio.ensure_future(
+            self._step_loop(ChatMessage(role=ChatRole.USER, content=brief), ask=asker.ask, cancel_flag=cancel_flag)
+        )
+        return await self._drive_delegated(task, asker, cancel_flag=cancel_flag)
 
-    def resume_delegated(self, suspension: DelegatedSuspension, answer_value: Any) -> ResultPayload | DelegatedSuspension:
-        """Continues a run exactly where it suspended — the paused
-        generator itself is the entire resumable state, so this is just
-        sending the answer into it."""
+    async def resume_delegated(self, suspension: DelegatedSuspension, answer_value: Any) -> ResultPayload | DelegatedSuspension:
+        """Continues a run exactly where it suspended — resolving the
+        Future the paused Task is awaiting is all it takes; the Task
+        itself is the entire resumable state."""
         if not self._delegated_enabled:
             raise RuntimeError("this AgentLoop wasn't constructed with enable_delegated_completion=True")
-        return self._drive_delegated(suspension._generator, answer_value, cancel_flag=suspension._cancel_flag)
+        suspension._asker.answer(answer_value)
+        return await self._drive_delegated(suspension._task, suspension._asker, cancel_flag=suspension._cancel_flag)
 
-    def _drive_delegated(
-        self, gen: StepGenerator, send_value: Any, *, cancel_flag: CancelFlag | None
+    async def _drive_delegated(
+        self, task: "asyncio.Task[ResultPayload]", asker: _Asker, *, cancel_flag: CancelFlag | None
     ) -> ResultPayload | DelegatedSuspension:
-        try:
-            ask = gen.send(send_value)
-        except StopIteration as stop:
-            return stop.value
-        return DelegatedSuspension(ask=ask, _generator=gen, _cancel_flag=cancel_flag)
+        ask_seen = asyncio.ensure_future(asker._ask_seen.wait())
+        done, _pending = await asyncio.wait({task, ask_seen}, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            ask_seen.cancel()
+            return await task
+        return DelegatedSuspension(ask=asker.pending, _task=task, _asker=asker, _cancel_flag=cancel_flag)
 
     # -- the shared step loop --------------------------------------------
 
-    def _step_loop(self, initial_message: ChatMessage, *, cancel_flag: CancelFlag | None = None) -> StepGenerator:
+    async def _step_loop(self, initial_message: ChatMessage, *, ask: Ask, cancel_flag: CancelFlag | None = None) -> ResultPayload:
         tagged: list[tuple[str | None, ChatMessage]] = [(self._current_frame_id(), initial_message)]
         plain: list[ChatMessage] = [initial_message]
         start = time.monotonic()
@@ -382,7 +436,7 @@ class AgentLoop:
 
             self._emit("event.model.request", {"step": step, "message_count": len(plain)})
             try:
-                response = self.provider.complete(self.workbench.render_prompt(plain), tools=self._tool_specs)
+                response = await self.provider.complete(self.workbench.render_prompt(plain), tools=self._tool_specs)
             except ProviderError as exc:
                 return self._commit(
                     tagged, ResultPayload(status="error", summary=f"model error: {exc}", cost=self._cost(start, total_tokens))
@@ -413,13 +467,13 @@ class AgentLoop:
                     tagged.append((self._current_frame_id(), msg))
                     return self._commit(tagged, payload)
 
-                content = yield from self._run_tool_call(tool_call, cancel_flag=cancel_flag)
+                content = await self._run_tool_call(tool_call, ask=ask, cancel_flag=cancel_flag)
                 msg = ChatMessage(role=ChatRole.TOOL, tool_call_id=tool_call.id, name=tool_call.name, content=content)
                 tagged.append((self._current_frame_id(), msg))
                 plain.append(msg)
                 # Re-checked here, not just at the top of the step: a
                 # suspended ask resumes *inside* _run_tool_call, well past
-                # that check, so a cancel arriving while paused would
+                # that check, so a cancel arriving while suspended would
                 # otherwise only be noticed one whole step too late.
                 if self._is_cancelled(cancel_flag):
                     return self._commit(tagged, self._cancelled_result(start, total_tokens))
@@ -473,9 +527,9 @@ class AgentLoop:
 
     # -- tool dispatch --------------------------------------------------
 
-    def _run_tool_call(self, tool_call: ToolCall, *, cancel_flag: CancelFlag | None = None) -> ToolCallGenerator:
+    async def _run_tool_call(self, tool_call: ToolCall, *, ask: Ask, cancel_flag: CancelFlag | None = None) -> str:
         if tool_call.name in self._local_tools:
-            return self._local_tools[tool_call.name](tool_call.arguments)
+            return await self._local_tools[tool_call.name](tool_call.arguments)
 
         executor = self._intercepted_local_tools.get(tool_call.name)
         target = FRAME_TOOL_TARGET if executor is not None else self._tool_targets.get(tool_call.name)
@@ -502,15 +556,17 @@ class AgentLoop:
 
         if outcome.decision == InterceptDecision.ASK:
             resume_token = uuid4().hex
-            answer = yield AskEnvelope(
-                source=self._source_id,
-                target=call.source,
-                trace_id=self.trace_id,
-                payload=AskPayload(
-                    question=self._render_ask_question(tool_call, outcome.reason),
-                    resume_token=resume_token,
-                    expected={"action": tool_call.name, "args": tool_call.arguments},
-                ),
+            answer = await ask(
+                AskEnvelope(
+                    source=self._source_id,
+                    target=call.source,
+                    trace_id=self.trace_id,
+                    payload=AskPayload(
+                        question=self._render_ask_question(tool_call, outcome.reason),
+                        resume_token=resume_token,
+                        expected={"action": tool_call.name, "args": tool_call.arguments},
+                    ),
+                )
             )
             if self._is_cancelled(cancel_flag):
                 # A resumed ask lands here, well past _step_loop's own
@@ -526,21 +582,21 @@ class AgentLoop:
                 return f"declined by user: {outcome.reason}"
 
         if executor is not None:
-            content = executor(tool_call.arguments)
+            content = await executor(tool_call.arguments)
             self._emit("event.tool.result", {"action": tool_call.name, "status": "ok"})
             return content
 
         try:
-            reply = self._dispatch(call)
-        except KeyboardInterrupt:
-            return self._cancelled_tool_content(call, tool_call.name)
+            reply = await self._dispatch(call)
+        except asyncio.CancelledError:
+            return await self._cancelled_tool_content(call, tool_call.name)
         except DeadlineExceeded as exc:
             return self._timed_out_tool_content(tool_call.name, exc)
 
         rounds = 0
         while isinstance(reply, AskEnvelope) and rounds < MAX_WORKER_ASK_ROUNDS:
             rounds += 1
-            value = yield reply
+            value = await ask(reply)
             if self._is_cancelled(cancel_flag):
                 return "cancelled by user"
             answer_env = AnswerEnvelope(
@@ -550,17 +606,17 @@ class AgentLoop:
                 payload=AnswerPayload(resume_token=reply.payload.resume_token, value=value),
             )
             try:
-                reply = self._dispatch(answer_env)
-            except KeyboardInterrupt:
-                return self._cancelled_tool_content(call, tool_call.name)
+                reply = await self._dispatch(answer_env)
+            except asyncio.CancelledError:
+                return await self._cancelled_tool_content(call, tool_call.name)
             except DeadlineExceeded as exc:
                 return self._timed_out_tool_content(tool_call.name, exc)
 
         self._emit("event.tool.result", {"action": tool_call.name, "status": self._reply_status(reply)})
         return self._reply_to_content(reply)
 
-    def _cancelled_tool_content(self, call: CallEnvelope, tool_name: str) -> str:
-        self._send_cancel(call)
+    async def _cancelled_tool_content(self, call: CallEnvelope, tool_name: str) -> str:
+        await self._send_cancel(call)
         self._emit("event.tool.result", {"action": tool_name, "status": "cancelled"})
         return f"cancelled by user (Ctrl-C) while running {tool_name!r}"
 
@@ -574,18 +630,18 @@ class AgentLoop:
         base = reason or f"Allow {tool_call.name}?"
         return f"{base} — {tool_call.name}({args_text}) [y/N]"
 
-    def _send_cancel(self, call: CallEnvelope) -> None:
+    async def _send_cancel(self, call: CallEnvelope) -> None:
         """Best-effort: tells the target worker to stop an in-flight call
-        after a KeyboardInterrupt. Swallows any failure — the original
-        KeyboardInterrupt has already been handled (the call is being
-        treated as cancelled either way); a failed notification just means
-        the worker keeps running to its own completion unaware.
-
-        This branch itself is correct and tested (test_agent_loop.py's
-        TestKeyboardInterruptDuringDispatch), but real Ctrl-C doesn't
-        reliably reach it today — see bus.Requester.call()'s docstring for
-        why pynng's blocking recv() doesn't hand control back to Python in
-        time to raise one.
+        after the caller's own Task was cancelled (a real Ctrl-C, now that
+        the whole call chain is async and a cancelled Task's
+        asyncio.CancelledError reliably reaches here — see bus.py's module
+        docstring). Swallows any failure — the original cancellation has
+        already been handled (the call is being treated as cancelled
+        either way); a failed notification just means the worker keeps
+        running to its own completion unaware. Awaited directly (not
+        fire-and-forget): this Task was JUST cancelled once already and
+        swallowed it, so nothing guarantees the event loop gets another
+        chance to run a detached background Task before this one finishes.
 
         ``control_dispatch`` is one fixed callable (see Dispatch), bound to
         whichever single worker's control channel matters most — in
@@ -600,7 +656,7 @@ class AgentLoop:
         if self._control_dispatch is None:
             return
         try:
-            self._control_dispatch(
+            await self._control_dispatch(
                 CancelEnvelope(
                     source=self._source_id,
                     target=call.target,
@@ -636,7 +692,7 @@ class AgentLoop:
 
     # -- local tools ------------------------------------------------------
 
-    def _handle_pin(self, args: dict[str, Any]) -> str:
+    async def _handle_pin(self, args: dict[str, Any]) -> str:
         key, value = args.get("key"), args.get("value")
         if key is None or value is None:
             return "error: pin requires 'key' and 'value'"
@@ -646,7 +702,7 @@ class AgentLoop:
             return f"error: {exc}"
         return f"pinned {key!r}"
 
-    def _handle_unpin(self, args: dict[str, Any]) -> str:
+    async def _handle_unpin(self, args: dict[str, Any]) -> str:
         key = args.get("key")
         if key is None:
             return "error: unpin requires 'key'"
@@ -656,7 +712,7 @@ class AgentLoop:
             return f"error: no such pin {key!r}"
         return f"unpinned {key!r}"
 
-    def _handle_read_output(self, args: dict[str, Any]) -> str:
+    async def _handle_read_output(self, args: dict[str, Any]) -> str:
         output_id = args.get("output_id")
         if output_id is None:
             return "error: read_output requires 'output_id'"
@@ -665,7 +721,7 @@ class AgentLoop:
         except OutputNotFound as exc:
             return f"error: {exc}"
 
-    def _handle_grep_output(self, args: dict[str, Any]) -> str:
+    async def _handle_grep_output(self, args: dict[str, Any]) -> str:
         output_id, pattern = args.get("output_id"), args.get("pattern")
         if output_id is None or pattern is None:
             return "error: grep_output requires 'output_id' and 'pattern'"
@@ -677,7 +733,7 @@ class AgentLoop:
 
     # -- frame tools (find_skill / mount_skill / unmount_skill) -----------
 
-    def _handle_find_skill(self, args: dict[str, Any]) -> str:
+    async def _handle_find_skill(self, args: dict[str, Any]) -> str:
         query = args.get("query")
         if not query:
             return "error: find_skill requires 'query'"
@@ -687,20 +743,20 @@ class AgentLoop:
             return f"error: {exc}"
         return ", ".join(results) if results else "(no matching skills)"
 
-    def _handle_mount_skill(self, args: dict[str, Any]) -> str:
+    async def _handle_mount_skill(self, args: dict[str, Any]) -> str:
         name = args.get("name")
         if not name:
             return "error: mount_skill requires 'name'"
         try:
-            frame = self.frame_tree.mount(name, owner="model")
+            frame = await self.frame_tree.mount(name, owner="model")
         except (SkillNotFound, SkillAlreadyMounted, FrameBudgetExceeded, SkillParseError) as exc:
             return f"error: {exc}"
         return f"mounted {frame.skill_name!r}"
 
-    def _handle_unmount_skill(self, args: dict[str, Any]) -> str:
+    async def _handle_unmount_skill(self, args: dict[str, Any]) -> str:
         name = args.get("name")
         try:
-            milestone = self.frame_tree.unmount(name, by="model") if name else self.frame_tree.unmount_focused(by="model")
+            milestone = await self.frame_tree.unmount(name, by="model") if name else await self.frame_tree.unmount_focused(by="model")
         except (FrameNotFound, FramePinned) as exc:
             return f"error: {exc}"
         return f"unmounted; milestone: {milestone}"

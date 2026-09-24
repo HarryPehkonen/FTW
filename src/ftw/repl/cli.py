@@ -10,6 +10,7 @@ live model (a scripted MockModelProvider can be passed straight through).
 from __future__ import annotations
 
 import argparse
+import asyncio
 import subprocess
 import sys
 import time
@@ -95,12 +96,12 @@ def spawn_skill_runner_worker(
     )
 
 
-def _wait_for_worker_or_crash(proc: subprocess.Popen, *, grace_s: float, name: str = "worker") -> None:
+async def _wait_for_worker_or_crash(proc: subprocess.Popen, *, grace_s: float, name: str = "worker") -> None:
     deadline = time.monotonic() + grace_s
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise WorkerStartupError(f"{name} exited during startup (exit code {proc.returncode}); see its output above")
-        time.sleep(_WORKER_POLL_INTERVAL_S)
+        await asyncio.sleep(_WORKER_POLL_INTERVAL_S)
 
 
 def _enable_readline() -> bool:
@@ -142,7 +143,7 @@ class ReplHandle:
         _stop_worker(self._skill_runner_proc)
 
 
-def build_repl_session(
+async def build_repl_session(
     *,
     ftw_home: Path,
     provider: IModelProvider | None = None,
@@ -171,7 +172,7 @@ def build_repl_session(
 
     shell_worker_address = worker_address or ipc_address(f"worker.tool.shell.{uuid4().hex[:8]}")
     shell_worker_proc = spawn_shell_worker(shell_worker_address, output_root)
-    _wait_for_worker_or_crash(shell_worker_proc, grace_s=worker_startup_grace_s, name="shell worker")
+    await _wait_for_worker_or_crash(shell_worker_proc, grace_s=worker_startup_grace_s, name="shell worker")
     shell_requester = Requester(shell_worker_address)
 
     skill_runner_address = skill_runner_address or ipc_address(f"skill.runner.{uuid4().hex[:8]}")
@@ -183,7 +184,7 @@ def build_repl_session(
         config_path=resolved_config_path,
         default_tier=tier,
     )
-    _wait_for_worker_or_crash(skill_runner_proc, grace_s=worker_startup_grace_s, name="skill runner")
+    await _wait_for_worker_or_crash(skill_runner_proc, grace_s=worker_startup_grace_s, name="skill runner")
     skill_runner_requester = Requester(skill_runner_address)
     skill_runner_control_requester = Requester(skill_runner_control_address(skill_runner_address))
 
@@ -229,15 +230,15 @@ def build_repl_session(
     )
 
 
-def _run_repl(args: argparse.Namespace) -> None:
-    handle = build_repl_session(
+async def _run_repl(args: argparse.Namespace) -> None:
+    handle = await build_repl_session(
         ftw_home=Path(args.ftw_home),
         config_path=Path(args.config),
         tier=args.tier,
         skills_dir=Path(args.skills_dir) if args.skills_dir else None,
     )
     try:
-        handle.session.run()
+        await handle.session.run()
     finally:
         handle.close()
 
@@ -276,7 +277,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--ftw-home", default=str(Path.home() / ".ftw"))
     parser.add_argument("--skills-dir", default=None, help="defaults to <ftw-home>/skills")
     _enable_readline()
-    _run_repl(parser.parse_args(argv))
+    asyncio.run(_run_repl(parser.parse_args(argv)))
 
 
 if __name__ == "__main__":

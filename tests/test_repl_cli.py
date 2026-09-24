@@ -4,10 +4,14 @@ deliverable: "REPL mounts... runs confirmed shell commands over NNG").
 This is the one place a real subprocess and a real ipc:// socket are
 exercised — everything else in the suite stays over inproc://. Still zero
 network calls and zero live LLM tokens: the model side is MockModelProvider.
+build_repl_session/_wait_for_worker_or_crash and AgentLoop.run_turn are all
+async - see cli.py's and agent_loop.py's module docstrings for why.
 """
 
 import io
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -68,44 +72,44 @@ class TestEnableReadline:
 
 
 class TestWaitForWorkerOrCrash:
-    def test_returns_quietly_when_the_process_stays_alive(self):
+    async def test_returns_quietly_when_the_process_stays_alive(self):
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
         try:
-            _wait_for_worker_or_crash(proc, grace_s=0.2)  # must not raise
+            await _wait_for_worker_or_crash(proc, grace_s=0.2)  # must not raise
         finally:
             proc.terminate()
             proc.wait(timeout=5)
 
-    def test_raises_promptly_when_the_process_exits_early(self):
+    async def test_raises_promptly_when_the_process_exits_early(self):
         proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])
         start = time.monotonic()
         try:
             with pytest.raises(WorkerStartupError, match="3"):
-                _wait_for_worker_or_crash(proc, grace_s=5.0)
+                await _wait_for_worker_or_crash(proc, grace_s=5.0)
         finally:
             proc.wait(timeout=5)
         assert time.monotonic() - start < 2.0  # detected the crash, didn't wait out the full grace period
 
 
 class TestBuildReplSessionWithRealWorker:
-    def test_shell_command_round_trips_through_a_real_subprocess_worker(self, isolated_runtime_dir, tmp_path):
+    async def test_shell_command_round_trips_through_a_real_subprocess_worker(self, isolated_runtime_dir, tmp_path):
         provider = MockModelProvider([assistant_run_command(), assistant_text("it printed the line")])
         out = io.StringIO()
 
-        handle = build_repl_session(
+        handle = await build_repl_session(
             ftw_home=tmp_path,
             provider=provider,
             input_fn=ScriptedInput(["y"]),  # confirms the one shell command
             output=out,
         )
         try:
-            reply = handle.session.agent_loop.run_turn("run something")
+            reply = await handle.session.agent_loop.run_turn("run something")
         finally:
             handle.close()
 
         assert reply == "it printed the line"
 
-    def test_default_events_address_matches_what_ftw_tap_dials_by_default(self, isolated_runtime_dir, tmp_path):
+    async def test_default_events_address_matches_what_ftw_tap_dials_by_default(self, isolated_runtime_dir, tmp_path):
         """ftw tap's own default (--address, observability/tap.py) has to
         be the same address the REPL actually publishes on with no
         override — otherwise `uv run ftw tap` silently receives nothing
@@ -114,7 +118,7 @@ class TestBuildReplSessionWithRealWorker:
         from ftw.runtime import ipc_address
 
         provider = MockModelProvider([assistant_text("hello")])
-        handle = build_repl_session(
+        handle = await build_repl_session(
             ftw_home=tmp_path,
             provider=provider,
             input_fn=ScriptedInput([]),
@@ -123,11 +127,60 @@ class TestBuildReplSessionWithRealWorker:
         try:
             with Subscriber(ipc_address("events"), topics=[""]) as sub:  # exactly tap.py's own default
                 time.sleep(0.05)  # let the subscription establish
-                handle.session.agent_loop.run_turn("hi")
+                await handle.session.agent_loop.run_turn("hi")
                 received = sub.recv(timeout_ms=2000)
             assert received.payload.topic.startswith("event.")
         finally:
             handle.close()
+
+
+class TestRealSigintDuringATurn:
+    """The actual real-world scenario this whole async migration exists to
+    fix: a real SIGINT arriving while a turn is genuinely blocked
+    dispatching to a real subprocess worker must interrupt it promptly -
+    not leave the REPL wedged until run_command's own 65s deadline
+    eventually elapses on its own. Everything below this test class
+    already proves the pieces in isolation (bus.py's TestRecvIsInterruptible,
+    agent_loop.py's real-task.cancel() test); this is the one place they're
+    all proven together, end to end, over a real ipc:// socket to a real
+    subprocess."""
+
+    async def test_real_sigint_cancels_a_turn_blocked_on_a_real_subprocess_worker(self, isolated_runtime_dir, tmp_path):
+        # Cancellation during dispatch is caught and reported as ordinary
+        # tool content (tested at the unit level in
+        # test_agent_loop.py::TestCancelledDuringDispatch), so the turn
+        # continues to a second model round rather than the whole turn
+        # dying with it - hence two scripted responses, matching that same
+        # pattern, not one.
+        provider = MockModelProvider(
+            [
+                tool_call_response("run_command", {"argv": [sys.executable, "-c", "import time; time.sleep(30)"]}, "c1"),
+                assistant_text("cancelled that for you"),
+            ]
+        )
+        out = io.StringIO()
+        handle = await build_repl_session(
+            ftw_home=tmp_path,
+            provider=provider,
+            input_fn=ScriptedInput(["y"]),  # confirms the shell command
+            output=out,
+        )
+        try:
+
+            def send_sigint_soon():
+                time.sleep(0.3)
+                os.kill(os.getpid(), signal.SIGINT)
+
+            threading.Thread(target=send_sigint_soon, daemon=True).start()
+
+            start = time.monotonic()
+            reply = await handle.session._run_turn_interruptible("run something long")  # noqa: SLF001 - whitebox: this IS what Ctrl-C drives
+            elapsed = time.monotonic() - start
+        finally:
+            handle.close()
+
+        assert reply == "cancelled that for you"
+        assert elapsed < 5.0  # nowhere near run_command's own 65s deadline
 
 
 def write_skill(root, relpath: str, name: str, description: str, body: str = "do the thing") -> None:
@@ -157,7 +210,7 @@ class TestPhase2Deliverable:
     two more completions, child-then-parent, fired from inside the
     unmount_skill tool call itself, before the turn's final answer)."""
 
-    def test_find_mount_nested_mount_run_shell_then_unmount_restores_baseline(self, isolated_runtime_dir, tmp_path):
+    async def test_find_mount_nested_mount_run_shell_then_unmount_restores_baseline(self, isolated_runtime_dir, tmp_path):
         skills_dir = tmp_path / "skills"
         write_skill(skills_dir, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose failing CMake configuration.")
         write_skill(skills_dir, "toolchain/verify_installed", "toolchain.verify_installed", "Verify a compiler toolchain.")
@@ -180,7 +233,7 @@ class TestPhase2Deliverable:
             ]
         )
         out = io.StringIO()
-        handle = build_repl_session(
+        handle = await build_repl_session(
             ftw_home=tmp_path,
             skills_dir=skills_dir,
             provider=provider,
@@ -190,11 +243,11 @@ class TestPhase2Deliverable:
         workbench = handle.session.agent_loop.workbench
 
         try:
-            first_reply = handle.session.agent_loop.run_turn("diagnose my cmake failure")
+            first_reply = await handle.session.agent_loop.run_turn("diagnose my cmake failure")
             assert workbench.mounted_skill_tokens > 0  # still mounted between turns
             assert workbench.milestones == []
 
-            second_reply = handle.session.agent_loop.run_turn("looks good, wrap it up")
+            second_reply = await handle.session.agent_loop.run_turn("looks good, wrap it up")
         finally:
             handle.close()
 
@@ -256,7 +309,9 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
     still respects "no live LLM tokens." It's what lets the skill-runner
     *subprocess* (which resolves a real OpenAICompatibleProvider from
     ftw.toml, since MockModelProvider can't cross a process boundary)
-    actually get a deterministic answer."""
+    actually get a deterministic answer. A plain sync HTTP server is fine
+    here even though the subprocess's own client is httpx.AsyncClient now
+    — HTTP itself doesn't care whether either side is sync or async."""
 
     responses: list[dict] = []
 
@@ -289,7 +344,7 @@ class TestDelegatedSkillRealSubprocess:
     other Phase 3 tests can't cross, since MockModelProvider can't be
     handed to a separate process."""
 
-    def test_delegate_skill_across_a_real_subprocess_boundary(self, isolated_runtime_dir, tmp_path):
+    async def test_delegate_skill_across_a_real_subprocess_boundary(self, isolated_runtime_dir, tmp_path):
         skills_dir = tmp_path / "skills"
         write_skill(skills_dir, "toolchain/verify_installed", "toolchain.verify_installed", "Verify a compiler toolchain is installed.")
 
@@ -317,7 +372,7 @@ class TestDelegatedSkillRealSubprocess:
                 ]
             )
             out = io.StringIO()
-            handle = build_repl_session(
+            handle = await build_repl_session(
                 ftw_home=tmp_path,
                 skills_dir=skills_dir,
                 config_path=config_path,
@@ -327,7 +382,7 @@ class TestDelegatedSkillRealSubprocess:
             )
             workbench = handle.session.agent_loop.workbench
             try:
-                reply = handle.session.agent_loop.run_turn("is gcc installed?")
+                reply = await handle.session.agent_loop.run_turn("is gcc installed?")
             finally:
                 handle.close()
         finally:
@@ -340,7 +395,7 @@ class TestDelegatedSkillRealSubprocess:
         assert len(tool_messages) == 1
         assert "gcc 13 is installed" in tool_messages[0].content
 
-    def test_delegated_run_asking_for_confirmation_is_relayed_across_the_real_subprocess_boundary(self, isolated_runtime_dir, tmp_path):
+    async def test_delegated_run_asking_for_confirmation_is_relayed_across_the_real_subprocess_boundary(self, isolated_runtime_dir, tmp_path):
         """The skill-runner subprocess's own interceptor asks for
         confirmation before running a shell command; that ASK crosses back
         to this process, gets answered here (scripted 'y'), and the answer
@@ -376,7 +431,7 @@ class TestDelegatedSkillRealSubprocess:
                 ]
             )
             out = io.StringIO()
-            handle = build_repl_session(
+            handle = await build_repl_session(
                 ftw_home=tmp_path,
                 skills_dir=skills_dir,
                 config_path=config_path,
@@ -385,7 +440,7 @@ class TestDelegatedSkillRealSubprocess:
                 output=out,
             )
             try:
-                reply = handle.session.agent_loop.run_turn("clean the build directory")
+                reply = await handle.session.agent_loop.run_turn("clean the build directory")
             finally:
                 handle.close()
         finally:
@@ -402,7 +457,7 @@ class TestCancelRealSubprocess:
     subprocess — not just exercised in-process against the worker object
     directly, the way test_skills_runner.py's TestCancel does."""
 
-    def test_cancel_over_the_real_control_channel_aborts_a_real_subprocess_run(self, isolated_runtime_dir, tmp_path):
+    async def test_cancel_over_the_real_control_channel_aborts_a_real_subprocess_run(self, isolated_runtime_dir, tmp_path):
         skills_dir = tmp_path / "skills"
         write_skill(skills_dir, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose CMake.")
 
@@ -421,7 +476,7 @@ class TestCancelRealSubprocess:
             """
         )
 
-        handle = build_repl_session(
+        handle = await build_repl_session(
             ftw_home=tmp_path,
             skills_dir=skills_dir,
             config_path=config_path,
@@ -434,7 +489,7 @@ class TestCancelRealSubprocess:
 
             span_id = "known-span-for-cancel-test"
             cancel = CancelEnvelope(source="repl.master", target="skill.runner", payload=CancelPayload(target_span_id=span_id))
-            cancel_reply = handle._skill_runner_control_requester.call(cancel)  # noqa: SLF001 - whitebox: exercising the real control socket directly
+            cancel_reply = await handle._skill_runner_control_requester.call(cancel)  # noqa: SLF001 - whitebox: exercising the real control socket directly
             assert isinstance(cancel_reply, ResultEnvelope)
 
             call = CallEnvelope(
@@ -443,7 +498,7 @@ class TestCancelRealSubprocess:
                 span_id=span_id,
                 payload=CallPayload(action="delegate_skill", args={"name": "cmake.diagnose_configure", "brief": "go"}),
             )
-            reply = handle._skill_runner_requester.call(call)  # noqa: SLF001
+            reply = await handle._skill_runner_requester.call(call)  # noqa: SLF001
         finally:
             handle.close()
 

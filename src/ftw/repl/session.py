@@ -6,10 +6,25 @@ whole interactive loop — conversation turns, slash commands, EOF handling —
 is unit-testable with a scripted input list and no subprocess. ``cli.py``
 is the thin layer that wires this to a real terminal (readline, stdin,
 stdout) plus worker supervision.
+
+Everything here is async (see bus.py's module docstring for why the whole
+call chain moved to asyncio), with ONE deliberate exception: reading a line
+from ``input_fn`` is bridged through ``asyncio.to_thread`` rather than
+rewritten as a native async reader, because ``input()``'s automatic
+GNU-readline integration (arrow-key history/editing, already wired up via
+cli.py's ``_enable_readline()``) has no clean async-native equivalent short
+of a much larger dependency. The accepted trade-off: cancelling the
+*awaiting* Task at an idle prompt (no turn in flight) unblocks the asyncio
+side, but the underlying thread stays blocked on the real stdin read until
+something is actually typed or EOF arrives — a narrower, separate gap from
+the one this migration exists to fix (a blocked *bus call during a turn*),
+documented alongside it in CLAUDE.md's Known Gaps.
 """
 
 from __future__ import annotations
 
+import asyncio
+import signal
 import sys
 from typing import Any, Callable, TextIO
 
@@ -33,10 +48,10 @@ def make_ask_answerer(input_fn: InputFn, output: TextIO) -> Callable[[AskEnvelop
     call through); anything else is passed through as free text, for a
     worker asking something other than yes/no. Fails closed on EOF."""
 
-    def answerer(ask: AskEnvelope) -> Any:
+    async def answerer(ask: AskEnvelope) -> Any:
         print(f"{ask.payload.question} ", end="", file=output)
         try:
-            answer = input_fn("")
+            answer = await asyncio.to_thread(input_fn, "")
         except EOFError:
             print("(EOF — declining)", file=output)
             return False
@@ -64,27 +79,52 @@ class ReplSession:
         self._output = output
         self._prompt = prompt
 
-    def run(self) -> None:
+    async def run(self) -> None:
         while True:
             try:
-                line = self._input_fn(self._prompt)
+                line = await self._read_line()
             except EOFError:
                 return
-            if not self.handle_line(line):
+            if not await self.handle_line(line):
                 return
 
-    def handle_line(self, line: str) -> bool:
+    async def _read_line(self) -> str:
+        return await asyncio.to_thread(self._input_fn, self._prompt)
+
+    async def handle_line(self, line: str) -> bool:
         """Processes one line. Returns False when the session should end."""
         line = line.strip()
         if not line:
             return True
         if line.startswith("/"):
-            return self._handle_command(line)
-        reply = self.agent_loop.run_turn(line)
+            return await self._handle_command(line)
+        reply = await self._run_turn_interruptible(line)
         self._print(reply)
         return True
 
-    def _handle_command(self, line: str) -> bool:
+    async def _run_turn_interruptible(self, line: str) -> str:
+        """Runs one turn as its own Task, with a real SIGINT cancelling it
+        promptly — the actual fix this whole migration exists to deliver.
+        A cancelled turn ends cleanly and the REPL is immediately usable
+        again for the next line, rather than the process staying wedged
+        until some blocking call eventually times out on its own."""
+        loop = asyncio.get_running_loop()
+        turn_task = asyncio.ensure_future(self.agent_loop.run_turn(line))
+        try:
+            loop.add_signal_handler(signal.SIGINT, turn_task.cancel)
+        except (NotImplementedError, RuntimeError):
+            pass  # signal handlers aren't available on every platform/loop; best-effort
+        try:
+            return await turn_task
+        except asyncio.CancelledError:
+            return "cancelled by user (Ctrl-C)"
+        finally:
+            try:
+                loop.remove_signal_handler(signal.SIGINT)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+
+    async def _handle_command(self, line: str) -> bool:
         parts = line.split(maxsplit=1)
         cmd = parts[0]
 
@@ -98,11 +138,11 @@ class ReplSession:
             self._print("cleared turn horizon")
             return True
         if cmd == "/mount":
-            return self._cmd_mount(parts)
+            return await self._cmd_mount(parts)
         if cmd == "/unmount":
-            return self._cmd_unmount(parts)
+            return await self._cmd_unmount(parts)
         if cmd == "/focus":
-            return self._cmd_focus(parts)
+            return await self._cmd_focus(parts)
         if cmd == "/frames":
             return self._cmd_frames()
 
@@ -111,7 +151,7 @@ class ReplSession:
 
     # -- skill mounting commands (ftw_plan.md §3.2 Frames) -----------------
 
-    def _cmd_mount(self, parts: list[str]) -> bool:
+    async def _cmd_mount(self, parts: list[str]) -> bool:
         if self.agent_loop.frame_tree is None:
             self._print("no skill store configured")
             return True
@@ -122,30 +162,30 @@ class ReplSession:
             self._print("usage: /mount [--pin] <skill>")
             return True
         try:
-            frame = self.agent_loop.frame_tree.mount(names[0], owner="user", pinned=pinned)
+            frame = await self.agent_loop.frame_tree.mount(names[0], owner="user", pinned=pinned)
         except (FrameError, SkillNotFound) as exc:
             self._print(f"error: {exc}")
             return True
         self._print(f"mounted {frame.skill_name!r}" + (" (pinned)" if pinned else ""))
         return True
 
-    def _cmd_unmount(self, parts: list[str]) -> bool:
+    async def _cmd_unmount(self, parts: list[str]) -> bool:
         if self.agent_loop.frame_tree is None:
             self._print("no skill store configured")
             return True
         name = parts[1].strip() if len(parts) > 1 else ""
         try:
             if name:
-                milestone = self.agent_loop.frame_tree.unmount(name, by="user")
+                milestone = await self.agent_loop.frame_tree.unmount(name, by="user")
             else:
-                milestone = self.agent_loop.frame_tree.unmount_focused(by="user")
+                milestone = await self.agent_loop.frame_tree.unmount_focused(by="user")
         except FrameError as exc:
             self._print(f"error: {exc}")
             return True
         self._print(f"unmounted; milestone: {milestone}")
         return True
 
-    def _cmd_focus(self, parts: list[str]) -> bool:
+    async def _cmd_focus(self, parts: list[str]) -> bool:
         if self.agent_loop.frame_tree is None:
             self._print("no skill store configured")
             return True

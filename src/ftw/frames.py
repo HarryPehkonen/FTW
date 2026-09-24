@@ -20,7 +20,7 @@ and a user who wants a fresh top-level mount instead just runs `/focus`
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Awaitable, Callable, Literal
 from uuid import uuid4
 
 from ftw.providers import ChatMessage, ChatRole, IModelProvider
@@ -30,7 +30,7 @@ from ftw.tokens import count_tokens
 from ftw.workbench import ContextWorkbench
 
 Owner = Literal["model", "user"]
-Summarizer = Callable[[SkillManifest, str], "str | None"]
+Summarizer = Callable[[SkillManifest, str], Awaitable["str | None"]]
 
 
 class FrameError(Exception):
@@ -102,7 +102,7 @@ def make_llm_summarizer(provider: IModelProvider) -> Summarizer:
     returns None — FrameTree's own deterministic fallback still applies,
     so an unmount is never blocked by a flaky summarization call."""
 
-    def summarize(manifest: SkillManifest, transcript: str) -> str | None:
+    async def summarize(manifest: SkillManifest, transcript: str) -> str | None:
         prompt = [
             ChatMessage(
                 role=ChatRole.SYSTEM,
@@ -114,7 +114,7 @@ def make_llm_summarizer(provider: IModelProvider) -> Summarizer:
             ChatMessage(role=ChatRole.USER, content=f"Skill: {manifest.name}\n\n{transcript or '(no activity)'}"),
         ]
         try:
-            response = provider.complete(prompt)
+            response = await provider.complete(prompt)
         except Exception:
             return None
         text = (response.message.content or "").strip()
@@ -139,7 +139,7 @@ class FrameTree:
 
     # -- mounting -----------------------------------------------------------
 
-    def mount(self, skill_name: str, *, owner: Owner = "model", pinned: bool = False) -> Frame:
+    async def mount(self, skill_name: str, *, owner: Owner = "model", pinned: bool = False) -> Frame:
         if self._find_by_skill(skill_name) is not None:
             raise SkillAlreadyMounted(f"{skill_name!r} is already mounted")
 
@@ -175,29 +175,29 @@ class FrameTree:
 
     # -- unmounting -----------------------------------------------------------
 
-    def unmount(self, skill_name: str, *, by: Owner = "model") -> str:
+    async def unmount(self, skill_name: str, *, by: Owner = "model") -> str:
         frame = self._require_by_skill(skill_name)
         if by == "model":
             pinned = self._find_pinned_in_subtree(frame)
             if pinned is not None:
                 raise FramePinned(f"{pinned.skill_name!r} is pinned; only the user can unmount it")
 
-        milestone = self._unmount_subtree(frame)
+        milestone = await self._unmount_subtree(frame)
         self._workbench.add_milestone(milestone)
         self._sync_mounted_text()
         return milestone
 
-    def unmount_focused(self, *, by: Owner = "model") -> str:
+    async def unmount_focused(self, *, by: Owner = "model") -> str:
         if self._focus_id is None:
             raise FrameNotFound("nothing is mounted/focused")
-        return self.unmount(self._frames[self._focus_id].skill_name, by=by)
+        return await self.unmount(self._frames[self._focus_id].skill_name, by=by)
 
-    def _unmount_subtree(self, frame: Frame) -> str:
-        child_summaries = [self._unmount_subtree(self._frames[cid]) for cid in list(frame.children_ids)]
+    async def _unmount_subtree(self, frame: Frame) -> str:
+        child_summaries = [await self._unmount_subtree(self._frames[cid]) for cid in list(frame.children_ids)]
 
         evicted_turns = self._workbench.evict_frame(frame.id)
         self._workbench.evict_frame_pins(frame.id)
-        own_summary = self._summarize(frame.manifest, evicted_turns)
+        own_summary = await self._summarize(frame.manifest, evicted_turns)
 
         milestone = own_summary
         if child_summaries:
@@ -211,10 +211,10 @@ class FrameTree:
 
         return milestone
 
-    def _summarize(self, manifest: SkillManifest, turns: list[list[ChatMessage]]) -> str:
+    async def _summarize(self, manifest: SkillManifest, turns: list[list[ChatMessage]]) -> str:
         if self._summarizer is not None:
             try:
-                result = self._summarizer(manifest, _render_transcript(turns))
+                result = await self._summarizer(manifest, _render_transcript(turns))
             except Exception:
                 result = None
             if result:

@@ -12,9 +12,8 @@ approved it. This worker only executes and reports.
 from __future__ import annotations
 
 import argparse
-import subprocess
+import asyncio
 import sys
-import threading
 import time
 
 from ftw.bus import Replier
@@ -29,7 +28,7 @@ class ShellToolWorker:
         self._default_timeout_s = timeout_s
         self._default_cwd = cwd
 
-    def handle(self, call: CallEnvelope) -> ResultEnvelope | ErrorEnvelope:
+    async def handle(self, call: CallEnvelope) -> ResultEnvelope | ErrorEnvelope:
         if call.payload.action != "run_command":
             return self._error(call, "unsupported_action", f"unsupported action: {call.payload.action!r}")
 
@@ -42,23 +41,33 @@ class ShellToolWorker:
 
         start = time.monotonic()
         try:
-            proc = subprocess.run(
-                argv,
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
                 cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        except subprocess.TimeoutExpired:
-            return self._error(call, "timeout", f"command timed out after {timeout_s}s: {argv!r}")
         except FileNotFoundError as exc:
             return self._error(call, "not_found", str(exc))
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except TimeoutError:
+            # mirrors subprocess.run(timeout=...)'s own timeout-then-kill
+            # behavior, just built from the async subprocess API — real
+            # async I/O (not a to_thread bridge) so a hung command is
+            # cancellable mid-flight from the caller's side too, not just
+            # abandoned in the background.
+            proc.kill()
+            await proc.wait()
+            return self._error(call, "timeout", f"command timed out after {timeout_s}s: {argv!r}")
         wall_time_ms = int((time.monotonic() - start) * 1000)
 
-        combined = proc.stdout
-        if proc.stderr:
+        stdout = stdout_bytes.decode(errors="replace")
+        stderr = stderr_bytes.decode(errors="replace")
+        combined = stdout
+        if stderr:
             sep = "\n" if combined and not combined.endswith("\n") else ""
-            combined += f"{sep}--- stderr ---\n{proc.stderr}"
+            combined += f"{sep}--- stderr ---\n{stderr}"
 
         output_id = self._outputs.save(call.trace_id, combined)
         excerpt = build_excerpt(combined)
@@ -86,17 +95,17 @@ class ShellToolWorker:
         )
 
 
-def run_worker(
+async def run_worker(
     address: str,
     output_root: str,
     *,
-    stop_event: threading.Event | None = None,
+    stop_event: asyncio.Event | None = None,
     num_workers: int = 4,
 ) -> None:
     """Blocks, serving CALLs, until ``stop_event`` is set."""
     worker = ShellToolWorker(OutputStore(output_root))
     with Replier(address, num_workers=num_workers) as rep:
-        rep.serve_forever(worker.handle, stop_event)
+        await rep.serve_forever(worker.handle, stop_event)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -106,7 +115,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     print(f"ftw shell worker listening on {args.address}", file=sys.stderr)
     try:
-        run_worker(args.address, args.output_root)
+        asyncio.run(run_worker(args.address, args.output_root))
     except KeyboardInterrupt:
         pass
 

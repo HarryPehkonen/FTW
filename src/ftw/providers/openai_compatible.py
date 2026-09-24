@@ -32,20 +32,26 @@ class OpenAICompatibleProvider(IModelProvider):
     ):
         self._model = model
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self._client = httpx.Client(
+        # httpx.AsyncClient (not httpx.Client): a real HTTP call is one of
+        # the two things (alongside the shell worker's subprocess) this
+        # migration made genuinely async I/O rather than a sync-call
+        # bridge, so a hung provider call is cancellable mid-flight, not
+        # just abandoned in the background — see bus.py's module docstring
+        # for the same reasoning applied to the NNG socket layer.
+        self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers=headers,
             timeout=timeout_s,
             transport=transport,
         )
 
-    def complete(self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None) -> ProviderResponse:
+    async def complete(self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None) -> ProviderResponse:
         payload: dict = {"model": self._model, "messages": [self._encode_message(m) for m in messages]}
         if tools:
             payload["tools"] = [self._encode_tool(t) for t in tools]
 
         try:
-            resp = self._client.post("/chat/completions", json=payload)
+            resp = await self._client.post("/chat/completions", json=payload)
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise ProviderError(f"{self._model}: HTTP {exc.response.status_code}: {exc.response.text}") from exc
@@ -59,14 +65,14 @@ class OpenAICompatibleProvider(IModelProvider):
 
         return self._decode_response(data)
 
-    def close(self) -> None:
-        self._client.close()
+    async def close(self) -> None:
+        await self._client.aclose()
 
-    def __enter__(self) -> "OpenAICompatibleProvider":
+    async def __aenter__(self) -> "OpenAICompatibleProvider":
         return self
 
-    def __exit__(self, *exc_info) -> None:
-        self.close()
+    async def __aexit__(self, *exc_info) -> None:
+        await self.close()
 
     # -- wire encoding/decoding -------------------------------------------
 

@@ -23,7 +23,7 @@ class MockModelProvider(IModelProvider):
         self._responses = list(responses)
         self.calls: list[RecordedCall] = []
 
-    def complete(self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None) -> ProviderResponse:
+    async def complete(self, messages: list[ChatMessage], tools: list[ToolSpec] | None = None) -> ProviderResponse:
         self.calls.append(RecordedCall(messages=messages, tools=tools))
         if not self._responses:
             raise RuntimeError("MockModelProvider: no scripted responses left")

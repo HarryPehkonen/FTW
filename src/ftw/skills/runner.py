@@ -24,13 +24,23 @@ matching ftw_plan.md §4's socket table) accepts CANCEL envelopes and sets
 a per-span_id flag that a run's loop checks cooperatively between steps —
 see agent_loop.py's ``cancel_flag``. Cooperative, not preemptive: an
 already-in-flight model call finishes before a cancel takes effect.
+
+Everything here is async (bus.py's module docstring explains why), and the
+old ``threading.Lock`` guarding ``_pending``/``_cancel_flags`` is gone, not
+just swapped for an asyncio.Lock: every worker Task for both Repliers here
+runs on this process's one event loop, and the check-then-mutate dict spans
+below have no ``await`` in them, so they're atomic w.r.t. other Tasks by
+construction — the same reasoning as bus.py's ``_IdempotencyCache``. The
+CANCEL-races-CALL ordering handled by the two ``setdefault`` calls below is
+about *message arrival order on the wire*, not dict thread-safety, so
+removing the lock doesn't change that reasoning at all.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
-import threading
 from typing import Callable
 
 from ftw.agent_loop import AgentLoop, DelegatedSuspension, Dispatch
@@ -96,16 +106,15 @@ class SkillRunnerWorker:
         self._default_max_steps = default_max_steps
         self._source_id = source_id
 
-        self._lock = threading.Lock()
         self._pending: dict[str, _PendingAsk] = {}
-        self._cancel_flags: dict[str, threading.Event] = {}
+        self._cancel_flags: dict[str, asyncio.Event] = {}
 
-    def handle(self, envelope: AnyEnvelope) -> ResultEnvelope | ErrorEnvelope | AskEnvelope:
+    async def handle(self, envelope: AnyEnvelope) -> ResultEnvelope | ErrorEnvelope | AskEnvelope:
         if isinstance(envelope, AnswerEnvelope):
-            return self._handle_answer(envelope)
-        return self._handle_call(envelope)
+            return await self._handle_answer(envelope)
+        return await self._handle_call(envelope)
 
-    def handle_cancel(self, envelope: AnyEnvelope) -> ResultEnvelope | ErrorEnvelope:
+    async def handle_cancel(self, envelope: AnyEnvelope) -> ResultEnvelope | ErrorEnvelope:
         """The control-channel handler (ftw_plan.md §4: "a busy call
         channel can't block a CANCEL"), served by a separate Replier."""
         if not isinstance(envelope, CancelEnvelope):
@@ -115,12 +124,11 @@ class SkillRunnerWorker:
                 trace_id=envelope.trace_id,
                 payload=ErrorPayload(code="unsupported_action", message=f"control channel only accepts CANCEL, got {envelope.type.value}"),
             )
-        with self._lock:
-            # setdefault, not get: a CANCEL can race the CALL it targets and
-            # arrive first, in which case there's nothing to set yet — this
-            # pre-creates the (already-set) flag so _handle_call finds it.
-            flag = self._cancel_flags.setdefault(envelope.payload.target_span_id, threading.Event())
-            flag.set()
+        # setdefault, not get: a CANCEL can race the CALL it targets and
+        # arrive first, in which case there's nothing to set yet — this
+        # pre-creates the (already-set) flag so _handle_call finds it.
+        flag = self._cancel_flags.setdefault(envelope.payload.target_span_id, asyncio.Event())
+        flag.set()
         return ResultEnvelope(
             source=self._source_id,
             target=envelope.source,
@@ -128,7 +136,7 @@ class SkillRunnerWorker:
             payload=ResultPayload(status="ok", summary="cancel requested"),
         )
 
-    def _handle_call(self, call: CallEnvelope) -> ResultEnvelope | ErrorEnvelope | AskEnvelope:
+    async def _handle_call(self, call: CallEnvelope) -> ResultEnvelope | ErrorEnvelope | AskEnvelope:
         # Matches the "delegate_skill" tool name agent_loop.py exposes to the
         # model (CallPayload.action is always the tool_call name, same
         # convention as run_command) — not an independent worker-side name.
@@ -161,20 +169,18 @@ class SkillRunnerWorker:
             trace_id=call.trace_id,
         )
 
-        with self._lock:
-            # A CANCEL can race a CALL for the same span_id and arrive first
-            # (control and call channels are two separate sockets); reuse
-            # whatever's already registered instead of clobbering it with a
-            # fresh, unset Event and silently losing that cancellation.
-            cancel_flag = self._cancel_flags.setdefault(call.span_id, threading.Event())
+        # A CANCEL can race a CALL for the same span_id and arrive first
+        # (control and call channels are two separate sockets); reuse
+        # whatever's already registered instead of clobbering it with a
+        # fresh, unset Event and silently losing that cancellation.
+        cancel_flag = self._cancel_flags.setdefault(call.span_id, asyncio.Event())
 
         full_brief = self._render_brief(brief, inputs)
-        outcome = loop.run_delegated(full_brief, cancel_flag=cancel_flag)
-        return self._finish(loop, call, call.span_id, outcome)
+        outcome = await loop.run_delegated(full_brief, cancel_flag=cancel_flag)
+        return await self._finish(loop, call, call.span_id, outcome)
 
-    def _handle_answer(self, answer: AnswerEnvelope) -> ResultEnvelope | ErrorEnvelope | AskEnvelope:
-        with self._lock:
-            entry = self._pending.pop(answer.payload.resume_token, None)
+    async def _handle_answer(self, answer: AnswerEnvelope) -> ResultEnvelope | ErrorEnvelope | AskEnvelope:
+        entry = self._pending.pop(answer.payload.resume_token, None)
         if entry is None:
             return ErrorEnvelope(
                 source=self._source_id,
@@ -184,15 +190,14 @@ class SkillRunnerWorker:
                     code="unknown_resume_token", message=f"no pending ask for resume_token {answer.payload.resume_token!r}"
                 ),
             )
-        outcome = entry.loop.resume_delegated(entry.suspension, answer.payload.value)
-        return self._finish(entry.loop, entry.original_call, entry.span_id, outcome)
+        outcome = await entry.loop.resume_delegated(entry.suspension, answer.payload.value)
+        return await self._finish(entry.loop, entry.original_call, entry.span_id, outcome)
 
-    def _finish(
+    async def _finish(
         self, loop: AgentLoop, original_call: CallEnvelope, span_id: str, outcome: ResultPayload | DelegatedSuspension
     ) -> ResultEnvelope | AskEnvelope:
         if isinstance(outcome, DelegatedSuspension):
-            with self._lock:
-                self._pending[outcome.ask.payload.resume_token] = _PendingAsk(loop, outcome, original_call, span_id)
+            self._pending[outcome.ask.payload.resume_token] = _PendingAsk(loop, outcome, original_call, span_id)
             return AskEnvelope(
                 source=original_call.target,
                 target=original_call.source,
@@ -200,8 +205,7 @@ class SkillRunnerWorker:
                 payload=AskPayload(question=outcome.ask.payload.question, resume_token=outcome.ask.payload.resume_token),
             )
 
-        with self._lock:
-            self._cancel_flags.pop(span_id, None)
+        self._cancel_flags.pop(span_id, None)
         return ResultEnvelope(
             source=original_call.target,
             target=original_call.source,
@@ -232,7 +236,7 @@ def control_address(address: str) -> str:
     return f"{address}.ctl"
 
 
-def run_worker(
+async def run_worker(
     address: str,
     *,
     skills_dir: str,
@@ -240,7 +244,7 @@ def run_worker(
     shell_worker_address: str,
     config_path: str,
     default_tier: str,
-    stop_event: threading.Event | None = None,
+    stop_event: asyncio.Event | None = None,
     num_workers: int = 4,
 ) -> None:
     """Blocks, serving CALLs (and, on a second Replier, CANCELs) until
@@ -258,12 +262,17 @@ def run_worker(
         # just blocking forever with no one there to answer.
         interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
     )
-    stop_event = stop_event or threading.Event()
+    stop_event = stop_event or asyncio.Event()
     try:
         with Replier(address, num_workers=num_workers) as rep, Replier(control_address(address), num_workers=1) as ctl_rep:
-            ctl_thread = threading.Thread(target=ctl_rep.serve_forever, args=(worker.handle_cancel, stop_event), daemon=True)
-            ctl_thread.start()
-            rep.serve_forever(worker.handle, stop_event)
+            # Both Repliers' worker pools run concurrently on this one
+            # event loop (was: two OS threads) — a busy call channel still
+            # can't block a CANCEL, since the control Replier's own Tasks
+            # get their own turns on the loop regardless of what the main
+            # Replier's Tasks are doing.
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(ctl_rep.serve_forever(worker.handle_cancel, stop_event))
+                tg.create_task(rep.serve_forever(worker.handle, stop_event))
     finally:
         shell_requester.close()
 
@@ -279,13 +288,15 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     print(f"ftw skill runner listening on {args.address} (control: {control_address(args.address)})", file=sys.stderr)
     try:
-        run_worker(
-            args.address,
-            skills_dir=args.skills_dir,
-            output_root=args.output_root,
-            shell_worker_address=args.shell_worker_address,
-            config_path=args.config,
-            default_tier=args.default_tier,
+        asyncio.run(
+            run_worker(
+                args.address,
+                skills_dir=args.skills_dir,
+                output_root=args.output_root,
+                shell_worker_address=args.shell_worker_address,
+                config_path=args.config,
+                default_tier=args.default_tier,
+            )
         )
     except KeyboardInterrupt:
         pass

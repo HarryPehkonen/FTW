@@ -64,7 +64,7 @@ class ProviderError(Exception):
 
 class IModelProvider(ABC):
     @abstractmethod
-    def complete(
+    async def complete(
         self,
         messages: list[ChatMessage],
         tools: list[ToolSpec] | None = None,

@@ -14,15 +14,28 @@ Design notes, matched to decisions made while planning:
   on ``idempotency_key`` so a caller that legitimately retries (e.g. after
   its own timeout) is safe to call again with the same key.
 * **Concurrency comes from pynng contexts**, not one thread per connection:
-  several worker threads each hold their own ``Context`` on the same
-  ``Rep0`` socket, and nng dispatches inbound requests across them.
+  ``num_workers`` asyncio Tasks, all on the ONE event loop of the owning
+  process, each hold their own ``Context`` on the same ``Rep0`` socket, and
+  nng dispatches inbound requests across them.
+* **Everything here is async, on purpose, to fix a real bug**: pynng's
+  blocking ``send()``/``recv()`` don't release control back to the
+  interpreter in time for a real SIGINT to be processed, so Ctrl-C during a
+  long call couldn't reliably reach the CANCEL machinery
+  (see ``tests/test_bus.py::TestRecvIsInterruptible`` and
+  ``CLAUDE.md``'s Known Gap). ``asend()``/``arecv()`` use NNG's real
+  ``nng_aio``/``nng_aio_cancel`` C API via pynng's asyncio integration —
+  confirmed empirically to interrupt a blocked wait promptly and to leave
+  the socket safely reusable afterward. ``Publisher``/``Subscriber`` are the
+  one deliberate exception: they're only used by the standalone ``ftw tap``
+  diagnostic viewer, not anywhere in the Ctrl-C-affected interactive path,
+  so they stay synchronous — not an oversight, a scope call.
 """
 
 from __future__ import annotations
 
-import threading
+import asyncio
 from pathlib import Path
-from typing import Callable
+from typing import Awaitable, Callable
 
 import pynng
 from pydantic import ValidationError
@@ -38,7 +51,7 @@ from ftw.protocol import (
     parse_event,
 )
 
-Handler = Callable[[AnyEnvelope], AnyEnvelope]
+Handler = Callable[[AnyEnvelope], Awaitable[AnyEnvelope]]
 
 _DEFAULT_TIMEOUT_MS = 30_000
 _DEFAULT_POLL_MS = 100
@@ -80,25 +93,25 @@ class Requester:
     def resend_time(self) -> int:
         return self._socket.resend_time
 
-    def call(self, envelope: AnyEnvelope, timeout_ms: int | None = None) -> AnyEnvelope:
-        # NOTE: a real Ctrl-C during this call is not reliably delivered.
-        # pynng's blocking send()/recv() don't release the GIL, so no
-        # thread — not even a background one running this same call — gets
-        # a chance to process a pending signal until the call itself
-        # returns (confirmed empirically). A short-poll retry loop was
-        # tried and reverted: retrying recv() on the same Req0 socket after
-        # a timeout hits a separate pynng bug (BadState) unless paired with
-        # resend + idempotency-key-based retry, which is real, separate
-        # work — see agent_loop.py's _send_cancel docstring.
+    async def call(self, envelope: AnyEnvelope, timeout_ms: int | None = None) -> AnyEnvelope:
+        # asend()/arecv() use NNG's real nng_aio/nng_aio_cancel API (via
+        # pynng's asyncio integration), not a blocking C call — a real
+        # Ctrl-C, wired up as loop.add_signal_handler(SIGINT, task.cancel)
+        # by the caller (see repl/session.py), reliably interrupts a call
+        # in progress here: asyncio.CancelledError propagates out of
+        # whichever of asend()/arecv() was in flight, and the socket is
+        # safely reusable for a later call afterward (confirmed
+        # empirically). This is the actual fix for the gap the old
+        # blocking-recv docstring here used to describe.
         timeout = timeout_ms if timeout_ms is not None else (envelope.deadline_ms or self._default_timeout_ms)
         self._socket.send_timeout = timeout
         self._socket.recv_timeout = timeout
         try:
-            self._socket.send(dump_envelope(envelope))
+            await self._socket.asend(dump_envelope(envelope))
         except pynng.exceptions.Timeout as exc:
             raise DeadlineExceeded("timed out sending call") from exc
         try:
-            raw = self._socket.recv()
+            raw = await self._socket.arecv()
         except pynng.exceptions.Timeout as exc:
             raise DeadlineExceeded("timed out waiting for reply") from exc
         return parse_envelope(raw)
@@ -114,45 +127,46 @@ class Requester:
 
 
 class _IdempotencyCache:
-    """Thread-safe: a repeated key returns the cached reply or waits for the
-    in-flight call to finish and returns its result — the handler runs at
-    most once per key, and distinct keys never block one another."""
+    """A repeated key returns the cached reply or waits for the in-flight
+    call to finish and returns its result — the handler runs at most once
+    per key, and distinct keys never block one another.
+
+    No lock: every worker Task for a given Replier runs on that Replier's
+    one event loop, and the check-then-mutate dict spans below (get/set,
+    with no ``await`` in between) can't be interleaved by another Task —
+    a context switch only happens *at* an ``await`` point. This is a real
+    simplification versus the old threading.Lock version, not just a
+    rename — but it depends on that one-event-loop invariant holding. Don't
+    spread a Replier's worker Tasks across threads or event loops."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
         self._done: dict[str, bytes] = {}
-        self._inflight: dict[str, threading.Event] = {}
+        self._inflight: dict[str, asyncio.Event] = {}
 
-    def get_or_compute(self, key: str, compute: Callable[[], bytes]) -> bytes:
-        with self._lock:
-            if key in self._done:
-                return self._done[key]
-            event = self._inflight.get(key)
-            if event is None:
-                event = threading.Event()
-                self._inflight[key] = event
-                owner = True
-            else:
-                owner = False
+    async def get_or_compute(self, key: str, compute: Callable[[], Awaitable[bytes]]) -> bytes:
+        if key in self._done:
+            return self._done[key]
+        event = self._inflight.get(key)
+        owner = event is None
+        if owner:
+            event = asyncio.Event()
+            self._inflight[key] = event
 
         if not owner:
-            event.wait()
-            with self._lock:
-                if key in self._done:
-                    return self._done[key]
-                raise RuntimeError(f"idempotent call for key {key!r} failed in the owning thread")
+            await event.wait()
+            if key in self._done:
+                return self._done[key]
+            raise RuntimeError(f"idempotent call for key {key!r} failed in the owning task")
 
         try:
-            result = compute()
+            result = await compute()
         except BaseException:
-            with self._lock:
-                del self._inflight[key]
+            del self._inflight[key]
             event.set()
             raise
 
-        with self._lock:
-            self._done[key] = result
-            del self._inflight[key]
+        self._done[key] = result
+        del self._inflight[key]
         event.set()
         return result
 
@@ -188,18 +202,22 @@ class Replier:
             payload=ErrorPayload(code="handler_error", message=f"{type(exc).__name__}: {exc}"),
         )
 
-    def _handle(self, envelope: AnyEnvelope, handler: Handler) -> bytes:
+    async def _handle(self, envelope: AnyEnvelope, handler: Handler) -> bytes:
         key = envelope.idempotency_key
         if key is None:
-            return dump_envelope(handler(envelope))
-        return self._dedupe.get_or_compute(key, lambda: dump_envelope(handler(envelope)))
+            return dump_envelope(await handler(envelope))
 
-    def _worker_loop(self, handler: Handler, stop_event: threading.Event | None) -> None:
+        async def compute() -> bytes:
+            return dump_envelope(await handler(envelope))
+
+        return await self._dedupe.get_or_compute(key, compute)
+
+    async def _worker_loop(self, handler: Handler, stop_event: asyncio.Event | None) -> None:
         ctx = self._socket.new_context()
         try:
             while stop_event is None or not stop_event.is_set():
                 try:
-                    raw = ctx.recv()
+                    raw = await ctx.arecv()
                 except pynng.exceptions.Timeout:
                     continue
                 except pynng.exceptions.Closed:
@@ -209,18 +227,19 @@ class Replier:
                 except ValidationError:
                     continue  # malformed on the wire; drop rather than crash the worker
                 try:
-                    reply_bytes = self._handle(envelope, handler)
+                    reply_bytes = await self._handle(envelope, handler)
                 except Exception as exc:
                     # A handler bug (or an upstream failure it didn't catch
                     # — a ProviderError, a UnicodeDecodeError on binary
                     # subprocess output, ...) must not take this whole
-                    # worker thread down with it: that's num_workers
+                    # worker Task down with it: that's num_workers
                     # concurrent slots reduced by one, permanently, for
                     # the life of the process. Reply with an error instead
-                    # and keep serving.
+                    # and keep serving. asyncio.CancelledError is a
+                    # BaseException, not caught here — it must propagate.
                     reply_bytes = dump_envelope(self._error_reply(envelope, exc))
                 try:
-                    ctx.send(reply_bytes)
+                    await ctx.asend(reply_bytes)
                 except pynng.exceptions.Closed:
                     return
         finally:
@@ -229,17 +248,13 @@ class Replier:
             except pynng.exceptions.Closed:
                 pass
 
-    def serve_forever(self, handler: Handler, stop_event: threading.Event | None = None) -> None:
+    async def serve_forever(self, handler: Handler, stop_event: asyncio.Event | None = None) -> None:
         """Blocks until ``stop_event`` is set (or forever if omitted).
-        Run this in its own thread."""
-        threads = [
-            threading.Thread(target=self._worker_loop, args=(handler, stop_event), daemon=True)
-            for _ in range(self._num_workers)
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        Await this as its own Task alongside whatever else runs on the
+        same event loop."""
+        async with asyncio.TaskGroup() as tg:
+            for _ in range(self._num_workers):
+                tg.create_task(self._worker_loop(handler, stop_event))
 
     def close(self) -> None:
         self._socket.close()
@@ -268,11 +283,11 @@ class DispatchRouter:
     def __init__(self, requesters: dict[str, Requester]):
         self._requesters = requesters
 
-    def __call__(self, envelope: AnyEnvelope) -> AnyEnvelope:
+    async def __call__(self, envelope: AnyEnvelope) -> AnyEnvelope:
         requester = self._requesters.get(envelope.target)
         if requester is None:
             raise KeyError(f"no requester configured for target {envelope.target!r} (known: {sorted(self._requesters)})")
-        return requester.call(envelope)
+        return await requester.call(envelope)
 
 
 class Publisher:
@@ -297,7 +312,14 @@ class Publisher:
 
 class Subscriber:
     """SUB socket pre-subscribed to a set of topic prefixes (byte-prefix
-    match against the ``<topic>\\0<json>`` framing in protocol.py)."""
+    match against the ``<topic>\\0<json>`` framing in protocol.py).
+
+    Deliberately stays synchronous (unlike Requester/Replier above): its
+    blocking recv() is structurally the same shape as Requester.call()'s
+    old blocking recv and *could* move to arecv() the same way later with
+    little new design work, but it's only used by the standalone `ftw tap`
+    diagnostic viewer, not anywhere in the Ctrl-C-affected interactive
+    path — migrating it now would add surface area for zero bug-fix value."""
 
     def __init__(self, address: str, topics: list[str], recv_timeout_ms: int = 1000):
         self._socket = pynng.Sub0(dial=address, recv_timeout=recv_timeout_ms)
