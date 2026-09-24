@@ -35,6 +35,7 @@ uv run ftw tap                                # in another terminal: stream live
 
 | Command | Does |
 | :--- | :--- |
+| `/help` | Shows this list of commands. |
 | `/context` | Shows the current token budget, zone by zone. |
 | `/clear` | Resets the turn history. |
 | `/mount [--pin] <skill>` | Mounts a skill; `--pin` stops the model from unmounting it. |

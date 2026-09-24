@@ -111,6 +111,27 @@ class TestSlashCommands:
         await session.run()
         assert "unknown command" in out.getvalue().lower()
         assert "/bogus" in out.getvalue()
+        assert "/help" in out.getvalue()  # points the user at how to find the real list
+
+
+class TestHelpCommand:
+    async def test_lists_every_command_with_a_description(self, tmp_path):
+        session, out = make_session([], ["/help", "/exit"], tmp_path)
+        await session.run()
+        text = out.getvalue()
+        # every command /help itself documents must actually appear, each
+        # with some descriptive text alongside it, not just a bare list
+        for cmd in ("/help", "/context", "/clear", "/mount", "/unmount", "/focus", "/frames", "/exit"):
+            assert cmd in text, f"{cmd!r} missing from /help output"
+        assert "quit" in text.lower()  # spot-check that descriptions, not just names, are present
+
+    async def test_help_does_not_require_a_frame_tree(self, tmp_path):
+        """/mount, /unmount, /focus, /frames are always listed - they each
+        already handle "no skill store configured" gracefully on their
+        own, so /help shouldn't need a frame_tree to describe them."""
+        session, out = make_session([], ["/help", "/exit"], tmp_path)
+        await session.run()  # must not raise even with no frame_tree wired
+        assert "/mount" in out.getvalue()
 
 
 def write_skill(root, relpath: str, name: str, description: str, body: str = "do the thing") -> None:

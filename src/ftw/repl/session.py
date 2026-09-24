@@ -55,6 +55,19 @@ from ftw.skills.registry import SkillNotFound
 
 InputFn = Callable[[str], str]
 
+# Single source of truth for both /help's own output and (kept in sync by
+# hand, since README.md's command table is prose, not code) the README.
+_COMMAND_HELP: list[tuple[str, str]] = [
+    ("/help", "Shows this list of commands."),
+    ("/context", "Shows the current token budget, zone by zone."),
+    ("/clear", "Resets the turn history."),
+    ("/mount [--pin] <skill>", "Mounts a skill; --pin stops the model from unmounting it."),
+    ("/unmount [skill]", "Unmounts a skill (or, with no name, whichever is focused), distilling its work into a milestone."),
+    ("/focus [skill]", "Switches which mounted skill new turns and mounts attach to; no argument returns focus to the root session."),
+    ("/frames", "Shows the mounted-skill tree."),
+    ("/exit", "Quits."),
+]
+
 
 def _blocking_read(input_fn: InputFn, prompt: str) -> str:
     """Runs ``input_fn`` directly on the calling (main) thread, with
@@ -193,6 +206,8 @@ class ReplSession:
         parts = line.split(maxsplit=1)
         cmd = parts[0]
 
+        if cmd == "/help":
+            return self._cmd_help()
         if cmd == "/exit":
             return False
         if cmd == "/context":
@@ -211,7 +226,7 @@ class ReplSession:
         if cmd == "/frames":
             return self._cmd_frames()
 
-        self._print(f"unknown command: {cmd}")
+        self._print(f"unknown command: {cmd} (try /help)")
         return True
 
     # -- skill mounting commands (ftw_plan.md §3.2 Frames) -----------------
@@ -269,6 +284,11 @@ class ReplSession:
             self._print("no skill store configured")
             return True
         self._print(self.agent_loop.frame_tree.render_tree())
+        return True
+
+    def _cmd_help(self) -> bool:
+        width = max(len(cmd) for cmd, _ in _COMMAND_HELP)
+        self._print("\n".join(f"{cmd.ljust(width)}  {desc}" for cmd, desc in _COMMAND_HELP))
         return True
 
     def _print(self, text: str) -> None:
