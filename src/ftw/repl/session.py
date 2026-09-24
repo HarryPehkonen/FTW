@@ -9,16 +9,36 @@ stdout) plus worker supervision.
 
 Everything here is async (see bus.py's module docstring for why the whole
 call chain moved to asyncio), with ONE deliberate exception: reading a line
-from ``input_fn`` is bridged through ``asyncio.to_thread`` rather than
-rewritten as a native async reader, because ``input()``'s automatic
-GNU-readline integration (arrow-key history/editing, already wired up via
-cli.py's ``_enable_readline()``) has no clean async-native equivalent short
-of a much larger dependency. The accepted trade-off: cancelling the
-*awaiting* Task at an idle prompt (no turn in flight) unblocks the asyncio
-side, but the underlying thread stays blocked on the real stdin read until
-something is actually typed or EOF arrives — a narrower, separate gap from
-the one this migration exists to fix (a blocked *bus call during a turn*),
-documented alongside it in CLAUDE.md's Known Gaps.
+from ``input_fn`` runs directly on the main thread — NOT bridged through
+``asyncio.to_thread`` — via :func:`_blocking_read`. Two confirmed-empirically
+reasons, not guesses:
+
+1. Nothing else needs the event loop running while blocked on a line of
+   input (no turn is in flight at the idle prompt; a worker-confirmation
+   prompt mid-turn is the one other thing happening, and it's the only
+   thing that matters right then too), so blocking the whole loop for
+   that duration costs nothing.
+2. ``asyncio.to_thread`` actively breaks Ctrl-C here. ``asyncio.run()``'s
+   own ``Runner`` installs a SIGINT handler that, on the *first* Ctrl-C,
+   only requests cooperative cancellation of the top-level task — which
+   has nowhere to land while that task is blocked in a plain synchronous
+   call, not an ``await``. Read via ``asyncio.to_thread`` specifically
+   makes this worse: cancelling the wrapping Task doesn't stop the
+   underlying OS thread (it's already running, and
+   ``concurrent.futures.Future.cancel()`` is a no-op on a running future),
+   so the thread stays genuinely blocked in the real read — and
+   ``asyncio.run()``'s own shutdown (``shutdown_default_executor()``)
+   later deadlocks trying to join it. Confirmed by reading
+   ``asyncio/runners.py`` directly and reproducing both failure modes in
+   isolation before landing this fix.
+
+:func:`_blocking_read` sidesteps both problems: it temporarily restores
+Python's plain default SIGINT handler (which raises ``KeyboardInterrupt``
+immediately, unconditionally — no cooperative two-stage dance, no thread
+to orphan) for the duration of the read, then restores whatever was
+active before — so turn execution downstream keeps its own,
+already-correct cancellation story (``_run_turn_interruptible``, which
+installs its own handler via ``loop.add_signal_handler``).
 """
 
 from __future__ import annotations
@@ -36,6 +56,21 @@ from ftw.skills.registry import SkillNotFound
 InputFn = Callable[[str], str]
 
 
+def _blocking_read(input_fn: InputFn, prompt: str) -> str:
+    """Runs ``input_fn`` directly on the calling (main) thread, with
+    Python's plain default SIGINT handler active for the duration — see
+    the module docstring for why this, and not ``asyncio.to_thread``, is
+    correct here. Raises ``KeyboardInterrupt`` on a single real Ctrl-C,
+    exactly like an ordinary synchronous script; callers decide what that
+    means for them (the idle prompt treats it as "quit"; a confirmation
+    prompt treats it as "declined")."""
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        return input_fn(prompt)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def make_ask_answerer(input_fn: InputFn, output: TextIO) -> Callable[[AskEnvelope], Any]:
     """Builds an AgentLoop ``ask_answerer`` callback: the one thing that
     answers ANY question AgentLoop asks — the interceptor's own ASK
@@ -46,14 +81,34 @@ def make_ask_answerer(input_fn: InputFn, output: TextIO) -> Callable[[AskEnvelop
     this way too — this is what makes it answerable at all. Yes/no reads
     as a bool (only an answer of exactly True ever allows an intercepted
     call through); anything else is passed through as free text, for a
-    worker asking something other than yes/no. Fails closed on EOF."""
+    worker asking something other than yes/no. Fails closed on EOF *and*
+    on a real Ctrl-C: declines the one action being confirmed here, via
+    the same ``_blocking_read`` used by the idle prompt. In practice this
+    usually ends the whole turn too, not just this one action — when
+    called mid-turn, ``_run_turn_interruptible`` has already registered
+    its own ``loop.add_signal_handler(SIGINT, turn_task.cancel)``, and
+    that registration's ``signal.set_wakeup_fd()`` plumbing stays live
+    underneath ``_blocking_read``'s temporary swap of the plain
+    ``signal.signal()`` callback (confirmed by reading
+    ``asyncio.unix_events``: the wakeup-fd write happens for the signal
+    itself, independent of which Python-level callback is currently
+    registered) — so the SAME Ctrl-C that declines here also reaches the
+    turn-level handler once this coroutine returns control at its next
+    real ``await``, cancelling the turn shortly after. That's a safe,
+    tested outcome (the REPL stays fully usable afterward), just a
+    broader one than "decline only" — not worth the real coupling a
+    narrower fix would need (threading the turn's own Task down into this
+    callback)."""
 
     async def answerer(ask: AskEnvelope) -> Any:
         print(f"{ask.payload.question} ", end="", file=output)
         try:
-            answer = await asyncio.to_thread(input_fn, "")
+            answer = _blocking_read(input_fn, "")
         except EOFError:
             print("(EOF — declining)", file=output)
+            return False
+        except KeyboardInterrupt:
+            print("(Ctrl-C — declining)", file=output)
             return False
         stripped = answer.strip()
         if stripped.lower() in ("y", "yes"):
@@ -82,14 +137,24 @@ class ReplSession:
     async def run(self) -> None:
         while True:
             try:
-                line = await self._read_line()
+                line = self._read_line()
             except EOFError:
                 return
             if not await self.handle_line(line):
                 return
 
-    async def _read_line(self) -> str:
-        return await asyncio.to_thread(self._input_fn, self._prompt)
+    def _read_line(self) -> str:
+        """A real SIGINT while idle here (no turn in flight) ends the
+        session, the same path as EOF - not a "cancel and re-prompt", the
+        way _run_turn_interruptible handles an actual turn. Plain
+        (synchronous, not async) on purpose: see the module docstring for
+        why blocking the whole event loop here is correct, and why the
+        previous asyncio.to_thread-based approach didn't just fail to
+        cancel cleanly but deadlocked asyncio.run()'s own shutdown."""
+        try:
+            return _blocking_read(self._input_fn, self._prompt)
+        except KeyboardInterrupt:
+            raise EOFError from None
 
     async def handle_line(self, line: str) -> bool:
         """Processes one line. Returns False when the session should end."""

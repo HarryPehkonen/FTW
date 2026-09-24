@@ -10,6 +10,10 @@ through asyncio.to_thread).
 """
 
 import io
+import os
+import signal
+import threading
+import time
 
 import pytest
 
@@ -251,3 +255,67 @@ class TestMakeAskAnswerer:
     async def test_fails_closed_on_eof(self):
         answerer = make_ask_answerer(ScriptedInput([]), io.StringIO())
         assert await answerer(self._ask()) is False
+
+    async def test_fails_closed_on_a_real_sigint(self):
+        """A real Ctrl-C while blocked answering a confirmation prompt
+        declines that one action - the same locally-recoverable way a
+        Ctrl-C during tool dispatch is already handled - rather than
+        crashing the whole turn with an uncaught KeyboardInterrupt."""
+
+        def blocking_input_fn(prompt: str = "") -> str:
+            time.sleep(10)
+            raise AssertionError("should have been interrupted before this returns")
+
+        out = io.StringIO()
+        answerer = make_ask_answerer(blocking_input_fn, out)
+
+        def send_sigint_soon():
+            time.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        threading.Thread(target=send_sigint_soon, daemon=True).start()
+
+        start = time.monotonic()
+        result = await answerer(self._ask())
+        elapsed = time.monotonic() - start
+
+        assert result is False
+        assert elapsed < 2.0
+        assert "Ctrl-C" in out.getvalue()
+
+
+class TestIdleSigintEndsTheSessionCleanly:
+    """A real SIGINT while sitting idle at the prompt (no turn in flight)
+    must end the session cleanly instead of hanging forever. The read now
+    runs directly on the main thread (see session.py's module docstring
+    for why asyncio.to_thread specifically broke this - it isn't just
+    "doesn't cancel cleanly", it deadlocks asyncio.run()'s own shutdown
+    trying to join the orphaned worker thread), with Python's plain
+    default SIGINT handler temporarily active so a single real Ctrl-C
+    raises KeyboardInterrupt immediately, exactly like an ordinary
+    synchronous script."""
+
+    async def test_real_sigint_while_idle_ends_the_session(self, tmp_path):
+        def blocking_input_fn(prompt: str = "") -> str:
+            time.sleep(10)
+            raise AssertionError("should have been interrupted before this returns")
+
+        loop = AgentLoop(
+            workbench=ContextWorkbench(),
+            provider=MockModelProvider([]),
+            output_store=OutputStore(tmp_path),
+            dispatch=async_raising(AssertionError("should not dispatch")),
+        )
+        session = ReplSession(agent_loop=loop, input_fn=blocking_input_fn, output=io.StringIO())
+
+        def send_sigint_soon():
+            time.sleep(0.3)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        threading.Thread(target=send_sigint_soon, daemon=True).start()
+
+        start = time.monotonic()
+        await session.run()  # must return promptly, not hang until blocking_input_fn ever returns
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 2.0

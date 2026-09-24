@@ -57,22 +57,43 @@ subprocess calls (`asyncio.create_subprocess_exec`) became genuinely async
 I/O too, not just thread-bridged, so a hung LLM call or shell command is
 now cancellable mid-flight, not just abandoned in the background.
 
-Phase 4 (interceptor policy beyond "confirm every shell command",
-deterministic verifiers) is next. See §8 of `ftw_plan.md` for the phase
-list.
-
-**Known gap:** Ctrl-C at an idle REPL prompt (no turn in flight) isn't
-reliably cancellable. `repl/session.py`'s line reading is bridged through
-`asyncio.to_thread(input_fn, prompt)` rather than rewritten as a native
-async reader, specifically to keep `input()`'s automatic GNU-readline
-integration (arrow-key history/editing); the trade-off is that cancelling
-the *awaiting* Task unblocks the asyncio side, but the underlying OS
-thread stays blocked on the real stdin read until something is actually
-typed or EOF arrives. This is narrower and separate from the bug the async
-migration above fixed (a blocked *bus call during a turn*, which is fully
-solved — `repl/session.py`'s `_run_turn_interruptible` cancels that
-promptly via a real SIGINT). Ctrl-C during an actual turn works; Ctrl-C
-while just sitting at the prompt with nothing running does not yet.
+A third follow-up pass then closed the one remaining Ctrl-C case the
+async migration didn't cover: an idle REPL prompt (no turn in flight)
+used to hang completely on a real SIGINT — not "not cancellable", a full,
+silent hang requiring the process to be killed from another terminal.
+Root cause, confirmed by reading `asyncio/runners.py` directly rather
+than assumed: `asyncio.run()`'s own `Runner` installs a two-stage SIGINT
+handler — the *first* Ctrl-C only requests cooperative cancellation of
+the top-level task, which has nowhere to land while that task is blocked
+in a plain synchronous call rather than an `await` (a *second* Ctrl-C is
+what actually raises `KeyboardInterrupt`, by design). The REPL's line
+reading used to be bridged through `asyncio.to_thread`, which made this
+worse, not better: cancelling the wrapping Task doesn't stop the
+underlying OS thread once it's already running a blocking read, so it
+stays orphaned — and `asyncio.run()`'s own shutdown
+(`shutdown_default_executor()`) later deadlocks joining it. Fixed by
+`repl/session.py`'s `_blocking_read`: reads now run directly on the main
+thread (nothing else needs the event loop while blocked on a line of
+input, whether at the idle prompt or answering a mid-turn confirmation),
+with Python's plain default SIGINT handler temporarily restored for the
+duration — a single real Ctrl-C now raises `KeyboardInterrupt`
+immediately, exactly like an ordinary synchronous script, no orphaned
+thread, no two-stage dance. Verified against the real `uv run ftw`
+binary, not just unit tests: a real, correctly-targeted `SIGINT` (not
+sent to `uv`'s own wrapper process, which is a distinct child-having
+process, not an exec-replacement — confirmed empirically, another false
+positive avoided) unblocks a genuinely-idle prompt in ~0.1s, repeatedly.
+Answering a mid-turn confirmation prompt with a real Ctrl-C declines that
+action *and*, in practice, ends the turn shortly after too (not "decline
+only" as first documented — `loop.add_signal_handler`'s
+`signal.set_wakeup_fd()` plumbing stays live underneath the temporary
+plain-handler swap, so the same signal also reaches
+`_run_turn_interruptible`'s own turn-level cancellation once
+`_blocking_read` returns control at the next real `await`; confirmed by
+reading `asyncio.unix_events` — a safe, tested outcome, just broader than
+originally intended, not worth the real coupling a narrower fix would
+need). Ctrl-C now works the same way everywhere in the REPL: during a
+turn, during a confirmation prompt, and at an idle prompt.
 
 **Known gap:** `idempotency_key` (`protocol.py`, `bus.py`'s
 `_IdempotencyCache`) is real, tested dedupe plumbing, but nothing in this
