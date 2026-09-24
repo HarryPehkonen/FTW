@@ -27,9 +27,19 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.4.0",
 ]
+fuzz = [
+    "hypothesis>=6.168.1",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests/fuzz is deliberately excluded from ordinary discovery - it needs
+# the separate "fuzz" dependency group (hypothesis), which a plain
+# `uv sync`/`uv run pytest` never installs. Naming the path explicitly
+# still works: `uv run --group fuzz pytest tests/fuzz`. See CLAUDE.md's
+# Testing section for the exact commands and what to remove to drop this
+# entirely.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "tests/fuzz"]
 timeout = 10
 addopts = "-ra --strict-markers"
 asyncio_mode = "auto"

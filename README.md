@@ -99,12 +99,15 @@ through the format and includes a couple of worked examples — mount it
 ## Development
 
 ```bash
-uv run pytest                        # full suite, a few seconds
-uv run scripts/export_schemas.py     # regenerate schemas/*.schema.json after touching protocol.py
+uv run pytest                                       # full suite, a few seconds
+uv run scripts/export_schemas.py                    # regenerate schemas/*.schema.json after touching protocol.py
+uv sync --group fuzz && uv run pytest tests/fuzz     # opt-in fuzz/property tests (see CLAUDE.md's Testing section)
 ```
 
 TDD throughout: no network calls or live model tokens anywhere in the test
-suite.
+suite. `tests/fuzz` is kept out of the way of ordinary development — its
+`hypothesis` dependency and the directory itself are both opt-in, so a
+plain `uv run pytest` never touches either.
 
 ## Project layout
 

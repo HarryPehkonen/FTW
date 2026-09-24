@@ -27,12 +27,24 @@ class OutputNotFound(Exception):
 # hole if unchecked, not a theoretical one.
 _SAFE_ID = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
+# Found by fuzzing (tests/fuzz/test_fuzz_output_store.py), not written in
+# response to a known exploit: an identifier can pass the character
+# allowlist above (all safe characters, just a lot of them) and still
+# blow past a real filesystem's per-component name limit (255 bytes on
+# most POSIX filesystems), which surfaces as an uncaught OSError deep
+# inside read()/save() rather than the clean, expected UnsafeIdentifier /
+# OutputNotFound every other bad identifier produces. Comfortably under
+# 255 to leave margin without needing to reason about it per-filesystem.
+_MAX_ID_LENGTH = 200
+
 
 class UnsafeIdentifier(ValueError):
     pass
 
 
 def _check_safe(value: str, *, what: str) -> None:
+    if len(value) > _MAX_ID_LENGTH:
+        raise UnsafeIdentifier(f"{what} is too long ({len(value)} chars, max {_MAX_ID_LENGTH}): {value[:50]!r}...")
     if not _SAFE_ID.match(value) or value in (".", "..") or "/" in value or "\\" in value:
         raise UnsafeIdentifier(f"unsafe {what}: {value!r}")
 

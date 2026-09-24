@@ -7,7 +7,7 @@ plus a handle, and the model reads more via read_output/grep_output.
 
 import pytest
 
-from ftw.outputs import OutputNotFound, OutputStore, build_excerpt
+from ftw.outputs import OutputNotFound, OutputStore, UnsafeIdentifier, build_excerpt
 
 
 class TestPathTraversal:
@@ -62,6 +62,30 @@ class TestPathTraversal:
         store = OutputStore(tmp_path / "store")
         output_id = store.save("trace-1", "hello")
         assert store.read("trace-1", output_id) == "hello"
+
+    def test_an_absurdly_long_output_id_is_rejected_cleanly_not_an_oserror(self, tmp_path):
+        """Found by fuzzing (tests/fuzz/test_fuzz_output_store.py), not
+        hand-written: an output_id that passes the character allowlist
+        (all safe chars, just a LOT of them) reaches the real filesystem
+        and raises OSError("File name too long") — read_output/grep_output
+        (agent_loop.py's local tools, no interceptor gate, fully
+        model-controlled) only catch OutputNotFound, so this crashed the
+        whole turn with a raw traceback instead of reporting a clean tool
+        error. _check_safe rejecting it up front, before any filesystem
+        call, closes this the same way it already closes traversal."""
+        store = OutputStore(tmp_path / "store")
+        long_id = "a" * 300
+
+        with pytest.raises(OutputNotFound):
+            store.read("trace-1", long_id)
+        # save() isn't reachable with a model-controlled output_id today
+        # (the shell worker always generates its own via uuid4()), so it
+        # raises the lower-level UnsafeIdentifier directly rather than
+        # the OutputNotFound wrapper _existing_path() provides for
+        # read/grep — consistent with its existing behavior for every
+        # other unsafe id, not a new inconsistency introduced by this fix.
+        with pytest.raises(UnsafeIdentifier):
+            store.save("trace-1", "content", output_id=long_id)
 
 
 class TestSaveAndRead:

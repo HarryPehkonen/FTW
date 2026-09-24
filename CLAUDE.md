@@ -167,6 +167,47 @@ the `isolated_runtime_dir` fixture so they never touch the real runtime dir.
 Every module lands with its test file written and shown failing *first* —
 don't skip the red step even when the implementation feels obvious.
 
+**Fuzz/property tests** (`tests/fuzz/`) target the three places arbitrary,
+possibly-adversarial input reaches a parser before anything gets close to
+a model: `protocol.parse_envelope` (the real wire boundary —
+`bus.Replier._worker_loop` specifically catches `pydantic.ValidationError`
+there, so anything else it might raise would take a worker down),
+`skills/manifest.parse_skill_md` (a `SKILL.md` a user wrote or copied),
+and `outputs.OutputStore` (the path-traversal defense, tested as an
+end-to-end invariant against the real `read`/`save`, not just the
+allowlist regex in isolation). Not hedged as temporary — kept deliberately
+separate so it's cheap to remove if it stops earning its keep, not because
+it's expected to. **Isolated on purpose**: a separate `fuzz` dependency
+group (`hypothesis`, not part of `dev`) that a plain `uv sync`/`uv run
+pytest` never installs, and `tests/fuzz` is excluded from ordinary
+collection via `pyproject.toml`'s `norecursedirs` — the two together mean
+nobody doing normal FTW development ever needs Hypothesis installed or
+even glances at this directory. Run it with
+`uv sync --group fuzz && uv run pytest tests/fuzz`, or `uv run --group
+fuzz pytest tests/fuzz` for a one-off. To remove the whole capability:
+`git rm -r tests/fuzz`, drop the `fuzz` group and the `tests/fuzz` entry
+in `norecursedirs` from `pyproject.toml`, `uv lock` to refresh the
+lockfile — nothing else in the codebase references any of it.
+
+**What it's actually found so far**, honestly: `parse_envelope` and
+`parse_skill_md` are already robust (pydantic's own JSON/Python validation
+handles deep nesting, huge strings, and type confusion cleanly throughout;
+the frontmatter regex isn't vulnerable to the adversarial dash patterns
+that would trigger catastrophic backtracking in a vulnerable one) — these
+two mostly *confirm* safety already provided by well-hardened libraries,
+which is still worth having as a permanent regression guard, just not
+where the yield has been. `OutputStore` is where fuzzing earned its keep:
+it found a real bug on the first real run, not a contrived one — an
+`output_id` that passes `_check_safe`'s character allowlist (all safe
+characters, just a lot of them) but exceeds a real filesystem's ~255-byte
+per-component name limit raised an uncaught `OSError` from deep inside
+`read()`/`save()`, which `read_output`/`grep_output` (model-facing local
+tools, no interceptor gate) didn't catch — a real crash path from
+ordinary model behavior, not an adversary. Fixed by capping identifier
+length in `_check_safe` itself, with a regression test
+(`test_outputs.py::TestPathTraversal::test_an_absurdly_long_output_id_is_rejected_cleanly_not_an_oserror`)
+alongside the fuzz test that found it.
+
 ## Layout
 
 See §7 of `ftw_plan.md`; phases are in §8. Source goes in `src/ftw/`, tests in `tests/`.
