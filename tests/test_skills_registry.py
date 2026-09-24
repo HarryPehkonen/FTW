@@ -83,6 +83,63 @@ class TestLoadAndGet:
         assert store.load_all() == {}
 
 
+class TestCatalogDirs:
+    """A SkillStore can search one or more read-only "catalog" directories
+    in addition to its own writable root — the bundled/internal skills
+    FTW ships with (ftw_plan.md's "internal" catalog concept). Mounted
+    directly from wherever they're found, never copied: an update to the
+    catalog is picked up immediately, and a same-named skill in the
+    store's own root always shadows the catalog version."""
+
+    def test_finds_a_skill_that_only_exists_in_a_catalog_dir(self, tmp_path):
+        catalog = tmp_path / "catalog"
+        write_skill(catalog, "cmake/diagnose_configure", CMAKE_SKILL)
+        store = SkillStore(tmp_path / "root", catalog_dirs=[catalog])
+
+        manifest, body = store.get("cmake.diagnose_configure")
+
+        assert manifest.name == "cmake.diagnose_configure"
+        assert "Reproduce the failure" in body
+
+    def test_root_skill_shadows_a_same_named_catalog_skill(self, tmp_path):
+        catalog = tmp_path / "catalog"
+        root = tmp_path / "root"
+        write_skill(catalog, "cmake/diagnose_configure", CMAKE_SKILL)
+        customized = CMAKE_SKILL.replace("Reproduce the failure", "MY CUSTOM VERSION")
+        write_skill(root, "cmake/diagnose_configure", customized)
+        store = SkillStore(root, catalog_dirs=[catalog])
+
+        _manifest, body = store.get("cmake.diagnose_configure")
+
+        assert "MY CUSTOM VERSION" in body
+        assert "Reproduce the failure" not in body
+
+    def test_load_all_merges_root_and_catalog(self, tmp_path):
+        catalog = tmp_path / "catalog"
+        root = tmp_path / "root"
+        write_skill(catalog, "cmake/diagnose_configure", CMAKE_SKILL)
+        write_skill(root, "toolchain/verify_installed", TOOLCHAIN_SKILL)
+        store = SkillStore(root, catalog_dirs=[catalog])
+
+        assert set(store.load_all()) == {"cmake.diagnose_configure", "toolchain.verify_installed"}
+
+    def test_find_searches_the_catalog_too(self, tmp_path):
+        catalog = tmp_path / "catalog"
+        write_skill(catalog, "git/bisect", GIT_SKILL)
+        store = SkillStore(tmp_path / "root", catalog_dirs=[catalog])
+
+        assert store.find("git commit regression bisect")[0] == "git.bisect"
+
+    def test_a_missing_catalog_dir_is_not_an_error(self, tmp_path):
+        store = SkillStore(tmp_path / "root", catalog_dirs=[tmp_path / "does-not-exist"])
+        assert store.load_all() == {}
+
+    def test_no_catalog_dirs_behaves_exactly_as_before(self, tmp_path):
+        write_skill(tmp_path, "cmake/diagnose_configure", CMAKE_SKILL)
+        store = SkillStore(tmp_path)
+        assert set(store.load_all()) == {"cmake.diagnose_configure"}
+
+
 class TestFindSkill:
     def make_store(self, tmp_path) -> SkillStore:
         write_skill(tmp_path, "cmake/diagnose_configure", CMAKE_SKILL)

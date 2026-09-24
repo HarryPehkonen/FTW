@@ -244,15 +244,19 @@ async def run_worker(
     shell_worker_address: str,
     config_path: str,
     default_tier: str,
+    catalog_dirs: list[str] | None = None,
     stop_event: asyncio.Event | None = None,
     num_workers: int = 4,
 ) -> None:
     """Blocks, serving CALLs (and, on a second Replier, CANCELs) until
-    ``stop_event`` is set."""
+    ``stop_event`` is set. ``catalog_dirs`` are the same read-only bundled
+    skill directories the main REPL searches (see repl/cli.py's
+    ``bundled_skills_dir``) — a delegated run needs to be able to find and
+    mount them too, not just the interactive REPL."""
     config = load_config(config_path)
     shell_requester = Requester(shell_worker_address)
     worker = SkillRunnerWorker(
-        SkillStore(skills_dir),
+        SkillStore(skills_dir, catalog_dirs=catalog_dirs),
         provider_factory=lambda tier: build_provider(config, tier or default_tier),
         output_store=OutputStore(output_root),
         dispatch=shell_requester.call,
@@ -285,6 +289,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--shell-worker-address", required=True)
     parser.add_argument("--config", default="ftw.toml")
     parser.add_argument("--default-tier", default="fast")
+    parser.add_argument("--catalog-dir", action="append", dest="catalog_dirs", default=[])
     args = parser.parse_args(argv)
     print(f"ftw skill runner listening on {args.address} (control: {control_address(args.address)})", file=sys.stderr)
     try:
@@ -296,6 +301,7 @@ def main(argv: list[str] | None = None) -> None:
                 shell_worker_address=args.shell_worker_address,
                 config_path=args.config,
                 default_tier=args.default_tier,
+                catalog_dirs=args.catalog_dirs,
             )
         )
     except KeyboardInterrupt:

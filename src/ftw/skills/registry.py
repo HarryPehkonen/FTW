@@ -62,22 +62,36 @@ def _bm25_rank(corpus: dict[str, str], query: str) -> list[str]:
 
 
 class SkillStore:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, catalog_dirs: list[str | Path] | None = None):
         self._root = Path(root)
+        # Read-only "internal" skill directories (ftw_plan.md's bundled
+        # catalog): searched in addition to root, never written to. A
+        # skill found only here is mounted directly from wherever it
+        # lives — never copied into root — so an FTW update to a bundled
+        # skill is picked up on the very next load, with no stale local
+        # copy to go out of date. See load_all()'s load order for the
+        # other half of this: root always wins on a name collision, so a
+        # user can shadow/override a bundled skill just by creating their
+        # own same-named one.
+        self._catalog_dirs = [Path(d) for d in (catalog_dirs or [])]
         self._cache: dict[str, tuple[SkillManifest, str]] | None = None
 
     def load_all(self) -> dict[str, tuple[SkillManifest, str]]:
         """Re-scans the skill store from disk. Any malformed or oversized
         skill fails the whole load, loudly, with the offending path —
-        never silently skipped."""
+        never silently skipped. Catalog directories are loaded first and
+        root last, so a root skill overwrites a same-named catalog entry
+        in the result — root always shadows the catalog, not the other
+        way around."""
         result: dict[str, tuple[SkillManifest, str]] = {}
-        for path in sorted(self._root.glob("**/SKILL.md")):
-            try:
-                manifest, body = parse_skill_md(path.read_text())
-                lint_skill_body(body)
-            except SkillParseError as exc:
-                raise type(exc)(f"{path}: {exc}") from exc
-            result[manifest.name] = (manifest, body)
+        for base in (*self._catalog_dirs, self._root):
+            for path in sorted(base.glob("**/SKILL.md")):
+                try:
+                    manifest, body = parse_skill_md(path.read_text())
+                    lint_skill_body(body)
+                except SkillParseError as exc:
+                    raise type(exc)(f"{path}: {exc}") from exc
+                result[manifest.name] = (manifest, body)
         self._cache = result
         return result
 

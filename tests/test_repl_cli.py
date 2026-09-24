@@ -199,6 +199,104 @@ def text_response(text: str) -> ProviderResponse:
     return ProviderResponse(message=ChatMessage(role=ChatRole.ASSISTANT, content=text))
 
 
+class TestBundledSkillsCatalog:
+    """examples/skills (the internal, read-only catalog - see
+    repl/cli.py's bundled_skills_dir) is always searched alongside
+    whatever session-specific --skills-dir was given, with zero extra
+    configuration. Proven here against the real wiring end to end - both
+    the main REPL's own SkillStore and the real skill-runner subprocess's
+    - not just the SkillStore unit tests."""
+
+    async def test_a_bundled_skill_is_mountable_with_no_skills_dir_configured(self, isolated_runtime_dir, tmp_path):
+        provider = MockModelProvider(
+            [
+                tool_call_response("mount_skill", {"name": "demo.greet"}, "c1"),
+                text_response("mounted the bundled demo skill"),
+            ]
+        )
+        handle = await build_repl_session(
+            ftw_home=tmp_path,  # tmp_path/skills is empty - nothing but the bundled catalog has this skill
+            provider=provider,
+            input_fn=ScriptedInput([]),
+            output=io.StringIO(),
+        )
+        try:
+            reply = await handle.session.agent_loop.run_turn("mount the demo skill")
+        finally:
+            handle.close()
+
+        assert reply == "mounted the bundled demo skill"
+        assert handle.session.agent_loop.workbench.mounted_skill_tokens > 0
+
+    async def test_a_users_own_skill_shadows_a_same_named_bundled_one(self, isolated_runtime_dir, tmp_path):
+        skills_dir = tmp_path / "skills"
+        write_skill(skills_dir, "demo/greet", "demo.greet", "The user's own customized version.", body="CUSTOM GREETING BODY")
+
+        provider = MockModelProvider([tool_call_response("mount_skill", {"name": "demo.greet"}, "c1"), text_response("mounted")])
+        handle = await build_repl_session(
+            ftw_home=tmp_path,
+            skills_dir=skills_dir,
+            provider=provider,
+            input_fn=ScriptedInput([]),
+            output=io.StringIO(),
+        )
+        try:
+            await handle.session.agent_loop.run_turn("mount the demo skill")
+            # the actual mounted text - not just "did a skill mount" - must
+            # be the user's own version, proving it shadowed the bundled
+            # examples/skills/demo/greet rather than that one winning
+            prompt = handle.session.agent_loop.workbench.render_prompt()
+            mounted_text = prompt[0].content
+        finally:
+            handle.close()
+
+        assert "CUSTOM GREETING BODY" in mounted_text
+        assert "no shell side effects" not in mounted_text  # the bundled version's own description text
+
+    async def test_delegate_skill_reaches_a_bundled_skill_through_the_real_subprocess(self, isolated_runtime_dir, tmp_path):
+        """The catalog wiring reaches the skill-runner subprocess too
+        (repl/cli.py passes --catalog-dir when spawning it) - not just the
+        main REPL's own in-process SkillStore, which the mount_skill tests
+        above already cover."""
+        server = start_mock_model_server(
+            [openai_tool_call_response("submit_result", {"status": "ok", "summary": "greeted via the bundled skill"})]
+        )
+        try:
+            config_path = tmp_path / "ftw.toml"
+            config_path.write_text(
+                f"""
+                [providers.mock_http]
+                kind = "openai_compatible"
+                base_url = "http://127.0.0.1:{server.server_port}/v1"
+
+                [tiers.fast]
+                provider = "mock_http"
+                model = "mock-model"
+                """
+            )
+            main_provider = MockModelProvider(
+                [
+                    tool_call_response("delegate_skill", {"name": "demo.greet", "brief": "say hi"}, "d1"),
+                    text_response("delegated to the bundled demo skill"),
+                ]
+            )
+            handle = await build_repl_session(
+                ftw_home=tmp_path,  # tmp_path/skills is empty - only the bundled catalog has demo.greet
+                config_path=config_path,
+                provider=main_provider,
+                input_fn=ScriptedInput([]),
+                output=io.StringIO(),
+            )
+            try:
+                reply = await handle.session.agent_loop.run_turn("delegate the demo skill")
+            finally:
+                handle.close()
+        finally:
+            server.shutdown()
+
+        assert reply == "delegated to the bundled demo skill"
+
+
 class TestPhase2Deliverable:
     """ftw_plan.md §8 Phase 2: "The model finds and mounts a skill (and a
     nested helper), works multi-turn with shell tools, and unmounts.

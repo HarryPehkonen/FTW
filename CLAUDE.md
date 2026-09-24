@@ -104,9 +104,14 @@ as a capability, not a claim that it's protecting anything in production
 yet.
 
 Run it: `uv run ftw` (needs a real key for the `fast`/`smart` tiers in
-`ftw.toml` — `DEEPSEEK_API_KEY` / `NOUS_API_KEY`). Point `--skills-dir` at
-`examples/skills` to try mounting right away, e.g.
-`uv run ftw --skills-dir examples/skills`. `uv run ftw tap` streams live
+`ftw.toml` — `DEEPSEEK_API_KEY` / `NOUS_API_KEY`). `examples/skills` is
+FTW's own bundled, read-only skill catalog (`repl/cli.py`'s
+`bundled_skills_dir`) — always searched alongside whatever `--skills-dir`
+points at, no flag needed to try mounting something (`/mount demo.greet`
+or `/mount meta.write_a_skill` right away). Mounted directly from there,
+never copied — see `skills/registry.py`'s `SkillStore.load_all` for the
+load order that makes a same-named skill under a session's own
+`--skills-dir` always shadow a bundled one. `uv run ftw tap` streams live
 events from a running session in another terminal.
 
 ## Non-negotiables
@@ -133,7 +138,10 @@ events from a running session in another terminal.
   languages; Python-only shortcuts (pickle, passing objects) are not allowed
   across the bus.
 - **Files are the source of truth.** Skills, memory, and traces are plain
-  Markdown/YAML/JSONL under `$FTW_HOME`. Indexes must be rebuildable from them.
+  Markdown/YAML/JSONL under `$FTW_HOME` — except FTW's own bundled skill
+  catalog (`examples/skills`), which ships with the installation itself,
+  is read-only, and is never written to or copied from. Indexes must be
+  rebuildable from them.
 - **Skills are task-scoped and ≤ 1,500 tokens** (body), measured with the
   project's canonical token counter, not a model-specific one.
 

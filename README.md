@@ -86,8 +86,15 @@ Reproduce the failure, grep the error log, report cause and fix.
 ```
 
 Point `--skills-dir` at a directory of these (default `<ftw-home>/skills`)
-and the model can find and mount them by name or by searching. Two
-examples live in [`examples/skills`](examples/skills).
+and the model can find and mount them by name or by searching. FTW also
+ships its own read-only, always-searched catalog
+([`examples/skills`](examples/skills)) — no configuration needed, and
+mounted straight from there rather than copied, so an FTW update to a
+bundled skill takes effect immediately. Save your own skill under the
+same `name` in your own skills directory to override a bundled one; your
+own version always wins. `meta.write_a_skill` in that catalog walks
+through the format and includes a couple of worked examples — mount it
+(`/mount meta.write_a_skill`) to get help writing a new one.
 
 ## Development
 

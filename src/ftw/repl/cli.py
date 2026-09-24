@@ -56,6 +56,20 @@ SHELL_WORKER_TARGET = "worker.tool.shell"  # matches agent_loop.DEFAULT_TOOL_TAR
 SKILL_RUNNER_TARGET = "skill.runner"
 
 
+def bundled_skills_dir() -> Path:
+    """The internal, read-only skill catalog shipped with FTW itself
+    (currently `examples/skills` at the repo root — resolved relative to
+    this installed module, not the caller's cwd). Never written to and
+    never copied from: SkillStore.load_all() reads it directly alongside
+    a session's own skills dir every time, so improving a bundled skill
+    in a later FTW version is picked up immediately, with no stale local
+    copy to go out of date, and a same-named skill in the session's own
+    directory always shadows it. Doesn't need to exist — SkillStore
+    tolerates a missing catalog dir the same way it tolerates a missing
+    root (glob on a nonexistent path just finds nothing)."""
+    return Path(__file__).resolve().parents[3] / "examples" / "skills"
+
+
 class WorkerStartupError(Exception):
     pass
 
@@ -74,26 +88,28 @@ def spawn_skill_runner_worker(
     shell_worker_address: str,
     config_path: Path,
     default_tier: str,
+    catalog_dirs: list[Path] | None = None,
 ) -> subprocess.Popen:
-    return subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "ftw.skills.runner",
-            "--address",
-            address,
-            "--skills-dir",
-            str(skills_dir),
-            "--output-root",
-            str(output_root),
-            "--shell-worker-address",
-            shell_worker_address,
-            "--config",
-            str(config_path),
-            "--default-tier",
-            default_tier,
-        ],
-    )
+    argv = [
+        sys.executable,
+        "-m",
+        "ftw.skills.runner",
+        "--address",
+        address,
+        "--skills-dir",
+        str(skills_dir),
+        "--output-root",
+        str(output_root),
+        "--shell-worker-address",
+        shell_worker_address,
+        "--config",
+        str(config_path),
+        "--default-tier",
+        default_tier,
+    ]
+    for catalog_dir in catalog_dirs or []:
+        argv += ["--catalog-dir", str(catalog_dir)]
+    return subprocess.Popen(argv)
 
 
 async def _wait_for_worker_or_crash(proc: subprocess.Popen, *, grace_s: float, name: str = "worker") -> None:
@@ -169,6 +185,7 @@ async def build_repl_session(
 
     resolved_skills_dir = skills_dir or (ftw_home / "skills")
     resolved_config_path = config_path or Path("ftw.toml")
+    catalog_dirs = [bundled_skills_dir()]
 
     shell_worker_address = worker_address or ipc_address(f"worker.tool.shell.{uuid4().hex[:8]}")
     shell_worker_proc = spawn_shell_worker(shell_worker_address, output_root)
@@ -183,6 +200,7 @@ async def build_repl_session(
         shell_worker_address=shell_worker_address,
         config_path=resolved_config_path,
         default_tier=tier,
+        catalog_dirs=catalog_dirs,
     )
     await _wait_for_worker_or_crash(skill_runner_proc, grace_s=worker_startup_grace_s, name="skill runner")
     skill_runner_requester = Requester(skill_runner_address)
@@ -200,7 +218,7 @@ async def build_repl_session(
         publisher.publish(evt)
 
     workbench = ContextWorkbench(system_anchor=system_anchor)
-    skill_store = SkillStore(resolved_skills_dir)
+    skill_store = SkillStore(resolved_skills_dir, catalog_dirs=catalog_dirs)
     frame_tree = FrameTree(workbench, skill_store, summarizer=make_llm_summarizer(provider))
 
     dispatch = DispatchRouter({SHELL_WORKER_TARGET: shell_requester, SKILL_RUNNER_TARGET: skill_runner_requester})
