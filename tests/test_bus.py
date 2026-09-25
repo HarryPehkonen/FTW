@@ -18,6 +18,7 @@ import signal
 import threading
 import time
 
+import pynng
 import pytest
 
 from ftw.bus import (
@@ -27,6 +28,7 @@ from ftw.bus import (
     Replier,
     Requester,
     Subscriber,
+    _IdempotencyCache,
 )
 from ftw.protocol import (
     AnswerEnvelope,
@@ -272,6 +274,46 @@ class TestIdempotencyDedupe:
         await task
 
 
+class TestIdempotencyCacheEviction:
+    """Unit-level, straight against _IdempotencyCache - a real dedupe run
+    long enough to matter would take way more than the handful of keys
+    the Replier-level tests above use, and doesn't need a real socket."""
+
+    async def test_done_cache_is_bounded(self):
+        cache = _IdempotencyCache()
+
+        async def compute() -> bytes:
+            return b"x"
+
+        for i in range(cache._MAX_DONE_ENTRIES + 500):
+            await cache.get_or_compute(f"key-{i}", compute)
+
+        assert len(cache._done) <= cache._MAX_DONE_ENTRIES
+
+    async def test_eviction_drops_the_oldest_entry_not_the_newest(self):
+        """Eviction has to make room by dropping the oldest entry, not the
+        newest - a key added moments ago (still within a realistic retry
+        window) must not be the one that gets thrown away."""
+        cache = _IdempotencyCache()
+        calls = []
+
+        async def compute() -> bytes:
+            calls.append(1)
+            return b"result"
+
+        for i in range(cache._MAX_DONE_ENTRIES):  # exactly fills the cache
+            await cache.get_or_compute(f"key-{i}", compute)
+        oldest_key, newest_key = "key-0", f"key-{cache._MAX_DONE_ENTRIES - 1}"
+
+        await cache.get_or_compute("one-more-key", compute)  # pushes past the cap, forcing one eviction
+
+        await cache.get_or_compute(newest_key, compute)  # a repeat - must still be cached
+        assert len(calls) == cache._MAX_DONE_ENTRIES + 1
+
+        await cache.get_or_compute(oldest_key, compute)  # a repeat too, but evicted - recomputed
+        assert len(calls) == cache._MAX_DONE_ENTRIES + 2
+
+
 class TestAskAnswerRoundTrip:
     async def test_handler_can_suspend_on_ask_and_resume_on_answer(self, unique_name):
         addr = inproc_address(unique_name)
@@ -377,6 +419,17 @@ class TestIpcTransport:
             assert reply.payload.summary == "handled"
             stop.set()
         await task
+
+    async def test_bind_refuses_to_clobber_a_genuinely_live_listener(self, isolated_runtime_dir):
+        """The stale-socket-file cleanup above must not fire when the
+        listener behind that file is very much alive - a second instance
+        started at the same address by accident should get a clear error,
+        not silently steal the bind out from under the first one (a
+        split-brain: both processes think they own the address, only one
+        ever actually receives traffic, and nothing tells you that)."""
+        addr = ipc_address("live-worker")
+        with Replier(addr), pytest.raises(pynng.exceptions.AddressInUse):
+            Replier(addr)
 
     def test_socket_file_is_removed_on_close(self, isolated_runtime_dir):
         addr = ipc_address("cleanup-worker")

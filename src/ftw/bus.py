@@ -34,6 +34,7 @@ Design notes, matched to decisions made while planning:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Self
@@ -138,10 +139,21 @@ class _IdempotencyCache:
     a context switch only happens *at* an ``await`` point. This is a real
     simplification versus the old threading.Lock version, not just a
     rename — but it depends on that one-event-loop invariant holding. Don't
-    spread a Replier's worker Tasks across threads or event loops."""
+    spread a Replier's worker Tasks across threads or event loops.
+
+    ``_done`` is bounded, not a plain growing dict: a long-lived process
+    would otherwise accumulate one entry per idempotency_key forever — a
+    real slow leak, just one that no test suite's short lifetime would
+    ever surface. FIFO eviction (oldest key out first) rather than LRU on
+    purpose: this cache exists to catch a retry arriving shortly after the
+    original call, not to keep "popular" keys around indefinitely, and
+    FIFO is both simpler to reason about and cheaper (no reordering on
+    every cache hit)."""
+
+    _MAX_DONE_ENTRIES = 10_000
 
     def __init__(self) -> None:
-        self._done: dict[str, bytes] = {}
+        self._done: OrderedDict[str, bytes] = OrderedDict()
         self._inflight: dict[str, asyncio.Event] = {}
 
     async def get_or_compute(self, key: str, compute: Callable[[], Awaitable[bytes]]) -> bytes:
@@ -164,6 +176,8 @@ class _IdempotencyCache:
             raise
 
         self._done[key] = result
+        if len(self._done) > self._MAX_DONE_ENTRIES:
+            self._done.popitem(last=False)
         del self._inflight[key]
         event.set()
         return result
@@ -172,7 +186,8 @@ class _IdempotencyCache:
 class Replier:
     """A REP socket serving concurrent requests via ``num_workers`` pynng
     contexts. Binds at construction; for ``ipc://`` addresses, a stale
-    socket file left by a crashed run is removed and the bind retried."""
+    socket file left by a crashed run (confirmed dead by a liveness probe,
+    not just "a file happens to exist") is removed and the bind retried."""
 
     def __init__(self, address: str, num_workers: int = 4, recv_timeout_ms: int = _DEFAULT_POLL_MS):
         self._address = address
@@ -186,10 +201,30 @@ class Replier:
             return pynng.Rep0(listen=address, recv_timeout=recv_timeout_ms)
         except pynng.exceptions.AddressInUse:
             stale_path = _socket_path_for_ipc(address)
-            if stale_path is None or not stale_path.exists():
+            if stale_path is None or not stale_path.exists() or Replier._has_live_listener(address):
                 raise
             stale_path.unlink()
             return pynng.Rep0(listen=address, recv_timeout=recv_timeout_ms)
+
+    @staticmethod
+    def _has_live_listener(address: str) -> bool:
+        """Tells a crashed run's leftover socket file (safe to remove and
+        rebind on) apart from a second instance genuinely still running at
+        this address (rebinding would silently steal the socket out from
+        under it - a split-brain where both processes think they own the
+        address and only one ever actually receives traffic, with nothing
+        to say so). A brief synchronous dial answers this: confirmed
+        empirically, connecting to a socket file with nothing listening
+        behind it fails fast with ConnectionRefused (a local Unix-domain
+        connect(), not a network wait), while dialing a live listener
+        succeeds immediately. Anything other than ConnectionRefused is
+        treated as "can't confirm this is safe" and left for a human to
+        look at, rather than guessed."""
+        try:
+            pynng.Req0(dial=address, block_on_dial=True, recv_timeout=200, send_timeout=200).close()
+            return True
+        except pynng.exceptions.ConnectionRefused:
+            return False
 
     @staticmethod
     def _error_reply(envelope: AnyEnvelope, exc: Exception) -> ErrorEnvelope:
