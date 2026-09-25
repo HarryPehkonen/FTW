@@ -770,7 +770,7 @@ class AgentLoop:
             frame = await self.frame_tree.mount(name, owner="model")
         except (SkillNotFound, SkillAlreadyMounted, FrameBudgetExceeded, SkillParseError) as exc:
             return f"error: {exc}"
-        return f"mounted {frame.skill_name!r}"
+        return f"mounted {frame.skill_name!r}: {frame.manifest.description}"
 
     async def _handle_unmount_skill(self, args: dict[str, Any]) -> str:
         assert self.frame_tree is not None  # only registered as a tool when a frame_tree was given

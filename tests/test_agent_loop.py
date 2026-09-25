@@ -526,6 +526,25 @@ class TestFrameToolsIntegration:
         assert tree.focused_skill_name == "cmake.diagnose_configure"
         assert loop.workbench.mounted_skill_tokens > 0
 
+    async def test_mount_skill_result_includes_the_description(self, tmp_path):
+        """Same reasoning as find_skill's result: the description is
+        already sitting right there on the mounted Frame's manifest, and
+        without it the mount confirmation is just an echo of the name the
+        model already knew when it called mount_skill."""
+        loop, _tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}),
+                assistant_text("mounted"),
+            ],
+        )
+        await loop.run_turn("mount cmake help")
+
+        second_call_messages = loop.provider.calls[1].messages
+        tool_result = next(m for m in second_call_messages if m.role == ChatRole.TOOL)
+        assert "cmake.diagnose_configure" in tool_result.content
+        assert "Diagnose failing CMake configuration." in tool_result.content
+
     async def test_mount_skill_unknown_name_reports_error_without_crashing(self, tmp_path):
         loop, _tree = self.make_loop_with_frames(
             tmp_path,
