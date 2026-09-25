@@ -495,6 +495,25 @@ class TestFrameToolsIntegration:
         )
         assert await loop.run_turn("find a skill") == "found it"
 
+    async def test_find_skill_result_includes_the_description(self, tmp_path):
+        """The description drives BM25 ranking (registry.py's find()) but
+        used to be dropped before the result ever reached the model - just
+        bare names, forcing a guess (or a mount) to learn what a candidate
+        actually does. It's already computed; just return it too."""
+        loop, _tree = self.make_loop_with_frames(
+            tmp_path,
+            [
+                assistant_tool_call("find_skill", {"query": "cmake configuration"}),
+                assistant_text("found it"),
+            ],
+        )
+        await loop.run_turn("find a skill")
+
+        second_call_messages = loop.provider.calls[1].messages
+        tool_result = next(m for m in second_call_messages if m.role == ChatRole.TOOL)
+        assert "cmake.diagnose_configure" in tool_result.content
+        assert "Diagnose failing CMake configuration." in tool_result.content
+
     async def test_mount_skill_mounts_into_the_shared_workbench(self, tmp_path):
         loop, tree = self.make_loop_with_frames(
             tmp_path,

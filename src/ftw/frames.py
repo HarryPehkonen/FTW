@@ -251,7 +251,7 @@ class FrameTree:
 
     # -- lookup / search ------------------------------------------------------
 
-    def find(self, query: str, *, top_k: int = 5) -> list[str]:
+    def find(self, query: str, *, top_k: int = 5) -> list[tuple[str, str]]:
         return self._skills.find(query, top_k=top_k)
 
     def _find_by_skill(self, skill_name: str) -> Frame | None:

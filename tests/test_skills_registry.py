@@ -128,7 +128,7 @@ class TestCatalogDirs:
         write_skill(catalog, "git/bisect", GIT_SKILL)
         store = SkillStore(tmp_path / "root", catalog_dirs=[catalog])
 
-        assert store.find("git commit regression bisect")[0] == "git.bisect"
+        assert store.find("git commit regression bisect")[0][0] == "git.bisect"
 
     def test_a_missing_catalog_dir_is_not_an_error(self, tmp_path):
         store = SkillStore(tmp_path / "root", catalog_dirs=[tmp_path / "does-not-exist"])
@@ -150,12 +150,20 @@ class TestFindSkill:
     def test_finds_best_matching_skill_by_description(self, tmp_path):
         store = self.make_store(tmp_path)
         results = store.find("cmake configuration failing")
-        assert results[0] == "cmake.diagnose_configure"
+        assert results[0][0] == "cmake.diagnose_configure"
 
     def test_finds_by_domain_word_in_name(self, tmp_path):
         store = self.make_store(tmp_path)
         results = store.find("git commit regression bisect")
-        assert results[0] == "git.bisect"
+        assert results[0][0] == "git.bisect"
+
+    def test_result_pairs_the_name_with_its_own_description(self, tmp_path):
+        store = self.make_store(tmp_path)
+        results = store.find("cmake configuration failing")
+        assert results[0] == (
+            "cmake.diagnose_configure",
+            "Diagnose failing CMake configuration and isolate root causes with evidence.",
+        )
 
     def test_respects_top_k(self, tmp_path):
         store = self.make_store(tmp_path)

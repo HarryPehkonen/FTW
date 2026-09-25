@@ -759,7 +759,7 @@ class AgentLoop:
             results = self.frame_tree.find(query, top_k=args.get("top_k", 5))
         except SkillParseError as exc:
             return f"error: {exc}"
-        return ", ".join(results) if results else "(no matching skills)"
+        return "\n".join(f"{name}: {description}" for name, description in results) if results else "(no matching skills)"
 
     async def _handle_mount_skill(self, args: dict[str, Any]) -> str:
         assert self.frame_tree is not None  # only registered as a tool when a frame_tree was given

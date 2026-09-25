@@ -371,7 +371,7 @@ class TestMakeLlmSummarizer:
 
 class TestFindAndRenderTree:
     def test_find_delegates_to_the_skill_store(self, tree):
-        assert tree.find("cmake configuration")[0] == "cmake.diagnose_configure"
+        assert tree.find("cmake configuration")[0][0] == "cmake.diagnose_configure"
 
     async def test_render_tree_shows_nesting_and_focus(self, tree):
         await tree.mount("cmake.diagnose_configure", owner="user")

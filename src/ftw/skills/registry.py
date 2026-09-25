@@ -116,7 +116,12 @@ class SkillStore:
             raise SkillNotFound(f"no skill named {name!r}")
         return cache[name]
 
-    def find(self, query: str, *, top_k: int = 5) -> list[str]:
+    def find(self, query: str, *, top_k: int = 5) -> list[tuple[str, str]]:
+        """Ranked (name, description) pairs - the description already
+        drives the ranking below, so it costs nothing extra to return it
+        too, and it's what lets a caller (the model, via find_skill) tell
+        apart two similarly-named candidates without mounting either."""
         cache = self._ensure_loaded()
         corpus = {name: f"{name.replace('.', ' ')} {manifest.description}" for name, (manifest, _) in cache.items()}
-        return _bm25_rank(corpus, query)[:top_k]
+        ranked = _bm25_rank(corpus, query)[:top_k]
+        return [(name, cache[name][0].description) for name in ranked]
