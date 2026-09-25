@@ -23,7 +23,13 @@ from ftw.frames import (
     SkillAlreadyMounted,
     make_llm_summarizer,
 )
-from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
+from ftw.providers import (
+    ChatMessage,
+    ChatRole,
+    MockModelProvider,
+    ProviderResponse,
+    ToolCall,
+)
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
 
@@ -93,7 +99,7 @@ class TestMount:
         child = await tree.mount("toolchain.verify_installed", owner="model")
 
         assert child.parent_id is not None
-        parent = tree._frames[child.parent_id]  # noqa: SLF001 - whitebox check of the tree shape
+        parent = tree._frames[child.parent_id]
         assert parent.skill_name == "cmake.diagnose_configure"
         assert tree.focused_skill_name == "toolchain.verify_installed"
 
@@ -368,7 +374,7 @@ class TestFindAndRenderTree:
         assert tree.find("cmake configuration")[0] == "cmake.diagnose_configure"
 
     async def test_render_tree_shows_nesting_and_focus(self, tree):
-        parent = await tree.mount("cmake.diagnose_configure", owner="user")
+        await tree.mount("cmake.diagnose_configure", owner="user")
         await tree.mount("toolchain.verify_installed", owner="model")
 
         text = tree.render_tree()

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Runs scripts/check.sh (lint + types + tests) before every commit. Enabled
+# by `git config core.hooksPath .githooks` (one-time, per clone - .git/hooks
+# itself isn't version-controlled, which is why this lives here instead).
+exec "$(git rev-parse --show-toplevel)/scripts/check.sh"

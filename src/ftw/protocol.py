@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
@@ -156,23 +156,13 @@ class InterceptEnvelope(_EnvelopeBase):
 
 
 AnyEnvelope = Annotated[
-    Union[
-        CallEnvelope,
-        ResultEnvelope,
-        ErrorEnvelope,
-        AskEnvelope,
-        AnswerEnvelope,
-        CancelEnvelope,
-        ProgressEnvelope,
-        EventEnvelope,
-        InterceptEnvelope,
-    ],
+    CallEnvelope | ResultEnvelope | ErrorEnvelope | AskEnvelope | AnswerEnvelope | CancelEnvelope | ProgressEnvelope | EventEnvelope | InterceptEnvelope,
     Field(discriminator="type"),
 ]
 
 _envelope_adapter: TypeAdapter[AnyEnvelope] = TypeAdapter(AnyEnvelope)
 
-_ENVELOPE_CLASSES_BY_TYPE: dict[str, type[BaseModel]] = {
+_ENVELOPE_CLASSES_BY_TYPE: dict[MessageType, type[BaseModel]] = {
     MessageType.CALL: CallEnvelope,
     MessageType.RESULT: ResultEnvelope,
     MessageType.ERROR: ErrorEnvelope,
@@ -229,5 +219,5 @@ def parse_event(raw: bytes) -> tuple[str, EventEnvelope]:
     topic_bytes, _, body = raw.partition(b"\x00")
     envelope = parse_envelope(body)
     if not isinstance(envelope, EventEnvelope):
-        raise ValueError(f"framed message is not an EVENT envelope: {envelope.type}")
+        raise TypeError(f"framed message is not an EVENT envelope: {envelope.type}")
     return topic_bytes.decode("utf-8"), envelope

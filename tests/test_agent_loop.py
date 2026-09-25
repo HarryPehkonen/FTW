@@ -20,7 +20,12 @@ import pytest
 from ftw.agent_loop import AgentLoop, DelegatedSuspension
 from ftw.bus import DeadlineExceeded
 from ftw.frames import FrameTree
-from ftw.intercept import ConfirmShellCommands, InterceptDecision, InterceptOutcome, PreCommitInterceptor
+from ftw.intercept import (
+    ConfirmShellCommands,
+    InterceptDecision,
+    InterceptOutcome,
+    PreCommitInterceptor,
+)
 from ftw.outputs import OutputStore
 from ftw.protocol import (
     AnswerEnvelope,
@@ -32,7 +37,14 @@ from ftw.protocol import (
     ResultEnvelope,
     ResultPayload,
 )
-from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderError, ProviderResponse, ToolCall
+from ftw.providers import (
+    ChatMessage,
+    ChatRole,
+    MockModelProvider,
+    ProviderError,
+    ProviderResponse,
+    ToolCall,
+)
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
 
@@ -410,7 +422,7 @@ class TestDelegateSkillTool:
             dispatch=async_raising(AssertionError()),
             skill_runner_target="skill.runner",
         )
-        assert "delegate_skill" in {t.name for t in with_target._tool_specs}  # noqa: SLF001
+        assert "delegate_skill" in {t.name for t in with_target._tool_specs}
 
         without_target = AgentLoop(
             workbench=ContextWorkbench(),
@@ -418,7 +430,7 @@ class TestDelegateSkillTool:
             output_store=OutputStore(tmp_path),
             dispatch=async_raising(AssertionError()),
         )
-        assert "delegate_skill" not in {t.name for t in without_target._tool_specs}  # noqa: SLF001
+        assert "delegate_skill" not in {t.name for t in without_target._tool_specs}
 
     async def test_delegate_skill_dispatches_to_the_configured_target_and_returns_the_summary(self, tmp_path):
         result_reply = ResultEnvelope(
@@ -506,7 +518,7 @@ class TestFrameToolsIntegration:
         assert await loop.run_turn("mount something bogus") == "no such skill"
 
     async def test_unmount_skill_produces_a_milestone(self, tmp_path):
-        loop, tree = self.make_loop_with_frames(
+        loop, _tree = self.make_loop_with_frames(
             tmp_path,
             [
                 assistant_tool_call("mount_skill", {"name": "cmake.diagnose_configure"}),
@@ -551,7 +563,7 @@ class TestFrameToolsIntegration:
         )
         await loop.run_turn("mount cmake and answer")
 
-        frame = tree._find_by_skill("cmake.diagnose_configure")  # noqa: SLF001 - whitebox
+        frame = tree._find_by_skill("cmake.diagnose_configure")
         evicted = loop.workbench.evict_frame(frame.id)
         assert len(evicted) == 1  # the committed turn was tagged to the frame that was focused when it committed
 
@@ -566,7 +578,7 @@ class TestFrameToolsIntegration:
         )
         await loop.run_turn("mount and note a finding")
 
-        frame = tree._find_by_skill("cmake.diagnose_configure")  # noqa: SLF001 - whitebox
+        frame = tree._find_by_skill("cmake.diagnose_configure")
         evicted_pins = loop.workbench.evict_frame_pins(frame.id)
         assert evicted_pins == {"finding": "missing openssl"}
 
@@ -727,7 +739,7 @@ class TestRunDelegated:
 
     def test_submit_result_tool_only_appears_when_enabled(self, tmp_path):
         delegated = self.make_delegated_loop(tmp_path, [submit_result_call()])
-        assert "submit_result" in {t.name for t in delegated._tool_specs}  # noqa: SLF001 - whitebox
+        assert "submit_result" in {t.name for t in delegated._tool_specs}
 
         interactive = AgentLoop(
             workbench=ContextWorkbench(),
@@ -735,7 +747,7 @@ class TestRunDelegated:
             output_store=OutputStore(tmp_path),
             dispatch=async_raising(AssertionError()),
         )
-        assert "submit_result" not in {t.name for t in interactive._tool_specs}  # noqa: SLF001
+        assert "submit_result" not in {t.name for t in interactive._tool_specs}
 
 
 class TestDelegatedAskPassthrough:
@@ -972,7 +984,7 @@ class TestCancelledDuringDispatch:
             interceptor=PreCommitInterceptor([]),
             output_root=tmp_path,
         )
-        loop._control_dispatch = control_dispatch  # noqa: SLF001 - whitebox: no public setter, and shouldn't need one
+        loop._control_dispatch = control_dispatch
 
         result = await loop.run_turn("run something long")
 
@@ -1006,7 +1018,7 @@ class TestCancelledDuringDispatch:
             interceptor=PreCommitInterceptor([]),
             output_root=tmp_path,
         )
-        loop._control_dispatch = control_dispatch  # noqa: SLF001
+        loop._control_dispatch = control_dispatch
 
         assert await loop.run_turn("run something long") == "gave up cleanly"
 

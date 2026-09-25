@@ -7,9 +7,15 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
-from ftw.skills.manifest import SkillManifest, SkillParseError, lint_skill_body, parse_skill_md
+from ftw.skills.manifest import (
+    SkillManifest,
+    SkillParseError,
+    lint_skill_body,
+    parse_skill_md,
+)
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _BM25_K1 = 1.5
@@ -62,7 +68,7 @@ def _bm25_rank(corpus: dict[str, str], query: str) -> list[str]:
 
 
 class SkillStore:
-    def __init__(self, root: str | Path, *, catalog_dirs: list[str | Path] | None = None):
+    def __init__(self, root: str | Path, *, catalog_dirs: Sequence[str | Path] | None = None):
         self._root = Path(root)
         # Read-only "internal" skill directories (ftw_plan.md's bundled
         # catalog): searched in addition to root, never written to. A

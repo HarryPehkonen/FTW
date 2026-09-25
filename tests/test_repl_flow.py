@@ -20,8 +20,8 @@ import pytest
 from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameTree
 from ftw.outputs import OutputStore
-from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse
 from ftw.protocol import AskEnvelope, AskPayload
+from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse
 from ftw.repl.session import ReplSession, make_ask_answerer
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
@@ -97,12 +97,12 @@ class TestSlashCommands:
         assert "System Anchor" in out.getvalue()
 
     async def test_clear_empties_turn_horizon(self, tmp_path):
-        session, out = make_session([assistant("ok")], ["hi", "/clear", "/exit"], tmp_path)
+        session, _out = make_session([assistant("ok")], ["hi", "/clear", "/exit"], tmp_path)
         await session.run()
         assert session.agent_loop.workbench.turns == []
 
     async def test_exit_stops_the_loop(self, tmp_path):
-        session, out = make_session([assistant("should not run")], ["/exit", "hello"], tmp_path)
+        session, _out = make_session([assistant("should not run")], ["/exit", "hello"], tmp_path)
         await session.run()
         assert session.agent_loop.provider.calls == []  # never reached "hello"
 
@@ -174,7 +174,7 @@ class TestMountCommands:
         assert "error" in out.getvalue().lower()
 
     async def test_mount_pin_flag_makes_the_frame_user_owned(self, tmp_path):
-        session, out = make_session_with_frames(
+        session, _out = make_session_with_frames(
             ["/mount --pin cmake.diagnose_configure", "/exit"], tmp_path
         )
         await session.run()
@@ -208,7 +208,7 @@ class TestUnmountFocusCommands:
         assert "error" in out.getvalue().lower()
 
     async def test_user_can_unmount_a_pinned_frame(self, tmp_path):
-        session, out = make_session_with_frames(
+        session, _out = make_session_with_frames(
             ["/mount --pin cmake.diagnose_configure", "/unmount cmake.diagnose_configure", "/exit"], tmp_path
         )
         await session.run()

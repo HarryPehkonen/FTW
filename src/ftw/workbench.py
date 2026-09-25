@@ -245,7 +245,7 @@ class ContextWorkbench:
         return evicted
 
     @staticmethod
-    def _scratchpad_tokens_of(scratchpad: dict[str, "_PinRecord"]) -> int:
+    def _scratchpad_tokens_of(scratchpad: dict[str, _PinRecord]) -> int:
         return count_tokens("\n".join(f"{k}={r.value}" for k, r in scratchpad.items()))
 
     @property

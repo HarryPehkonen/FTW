@@ -8,6 +8,7 @@ build_repl_session/_wait_for_worker_or_crash and AgentLoop.run_turn are all
 async - see cli.py's and agent_loop.py's module docstrings for why.
 """
 
+import asyncio
 import io
 import json
 import os
@@ -20,8 +21,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
-from ftw.repl.cli import WorkerStartupError, _enable_readline, _wait_for_worker_or_crash, build_repl_session
+from ftw.providers import (
+    ChatMessage,
+    ChatRole,
+    MockModelProvider,
+    ProviderResponse,
+    ToolCall,
+)
+from ftw.repl.cli import (
+    WorkerStartupError,
+    _enable_readline,
+    _wait_for_worker_or_crash,
+    build_repl_session,
+)
 
 
 class ScriptedInput:
@@ -73,7 +85,10 @@ class TestEnableReadline:
 
 class TestWaitForWorkerOrCrash:
     async def test_returns_quietly_when_the_process_stays_alive(self):
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+        # _wait_for_worker_or_crash takes a real subprocess.Popen (that's
+        # what cli.py hands it) - an asyncio subprocess wouldn't exercise
+        # the same .poll()-based interface.
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])  # noqa: ASYNC220
         try:
             await _wait_for_worker_or_crash(proc, grace_s=0.2)  # must not raise
         finally:
@@ -81,7 +96,7 @@ class TestWaitForWorkerOrCrash:
             proc.wait(timeout=5)
 
     async def test_raises_promptly_when_the_process_exits_early(self):
-        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])
+        proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])  # noqa: ASYNC220 (see above)
         start = time.monotonic()
         try:
             with pytest.raises(WorkerStartupError, match="3"):
@@ -126,7 +141,7 @@ class TestBuildReplSessionWithRealWorker:
         )
         try:
             with Subscriber(ipc_address("events"), topics=[""]) as sub:  # exactly tap.py's own default
-                time.sleep(0.05)  # let the subscription establish
+                await asyncio.sleep(0.05)  # let the subscription establish
                 await handle.session.agent_loop.run_turn("hi")
                 received = sub.recv(timeout_ms=2000)
             assert received.payload.topic.startswith("event.")
@@ -174,7 +189,7 @@ class TestRealSigintDuringATurn:
             threading.Thread(target=send_sigint_soon, daemon=True).start()
 
             start = time.monotonic()
-            reply = await handle.session._run_turn_interruptible("run something long")  # noqa: SLF001 - whitebox: this IS what Ctrl-C drives
+            reply = await handle.session._run_turn_interruptible("run something long")
             elapsed = time.monotonic() - start
         finally:
             handle.close()
@@ -411,9 +426,9 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
     here even though the subprocess's own client is httpx.AsyncClient now
     — HTTP itself doesn't care whether either side is sync or async."""
 
-    responses: list[dict] = []
+    responses: list[dict] = []  # noqa: RUF012 - always overridden per dynamic subclass below, never mutated as-is
 
-    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's naming convention
+    def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         self.rfile.read(length)
         body = json.dumps(self.responses.pop(0)).encode()
@@ -423,7 +438,7 @@ class _ScriptedOpenAIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, format, *args):  # noqa: A002 - silence per-request logging in test output
+    def log_message(self, format, *args):
         pass
 
 
@@ -583,11 +598,17 @@ class TestCancelRealSubprocess:
             output=io.StringIO(),
         )
         try:
-            from ftw.protocol import CallEnvelope, CallPayload, CancelEnvelope, CancelPayload, ResultEnvelope
+            from ftw.protocol import (
+                CallEnvelope,
+                CallPayload,
+                CancelEnvelope,
+                CancelPayload,
+                ResultEnvelope,
+            )
 
             span_id = "known-span-for-cancel-test"
             cancel = CancelEnvelope(source="repl.master", target="skill.runner", payload=CancelPayload(target_span_id=span_id))
-            cancel_reply = await handle._skill_runner_control_requester.call(cancel)  # noqa: SLF001 - whitebox: exercising the real control socket directly
+            cancel_reply = await handle._skill_runner_control_requester.call(cancel)
             assert isinstance(cancel_reply, ResultEnvelope)
 
             call = CallEnvelope(
@@ -596,7 +617,7 @@ class TestCancelRealSubprocess:
                 span_id=span_id,
                 payload=CallPayload(action="delegate_skill", args={"name": "cmake.diagnose_configure", "brief": "go"}),
             )
-            reply = await handle._skill_runner_requester.call(call)  # noqa: SLF001
+            reply = await handle._skill_runner_requester.call(call)
         finally:
             handle.close()
 

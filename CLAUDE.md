@@ -152,7 +152,8 @@ events from a running session in another terminal.
   `uv run ftw`. Add deps with `uv add`.
 - Deps: `pynng`, `pydantic`, `pyyaml`, `httpx`; dev: `pytest`, `pytest-timeout`,
   `pytest-asyncio` (`asyncio_mode = "auto"` in `pyproject.toml` — every
-  `async def test_...` just works, no `@pytest.mark.asyncio` needed).
+  `async def test_...` just works, no `@pytest.mark.asyncio` needed), `ruff`,
+  `mypy`, `types-PyYAML`.
 - Providers: DeepSeek and Nous Research Portal, both via the OpenAI-compatible
   adapter (see §6 of the plan). Live-provider checks are opt-in smoke tests,
   never part of `pytest`.
@@ -166,6 +167,26 @@ something to wait out). All bus tests run over `inproc://`; ipc:// tests use
 the `isolated_runtime_dir` fixture so they never touch the real runtime dir.
 Every module lands with its test file written and shown failing *first* —
 don't skip the red step even when the implementation feels obvious.
+
+**The commit gate** (`scripts/check.sh`: `ruff check`, then `mypy`, then
+`pytest -q` — cheapest check first, ~19s total on this codebase) runs on
+every commit once enabled. Since `.git/hooks/` itself isn't
+version-controlled, enabling it is a one-time, per-clone step:
+`git config core.hooksPath .githooks`. `ruff check`/`mypy` run with no
+project-specific rule config — both tools' own built-in defaults already
+give a clean, low-noise signal on this codebase; a handful of intentional
+exceptions (a best-effort `except Exception` that's documented right next
+to it, a `subprocess.Popen` a test needs because that's the real type the
+function under test takes, ...) are suppressed inline with a one-line
+`# noqa: CODE - why` rather than turned off project-wide. `mypy` only
+covers `src/ftw` (`[tool.mypy]` in `pyproject.toml`) — tests lean on
+pytest fixtures and monkeypatching in ways that don't type-check cleanly
+for little real benefit; `pynng` has no stubs/py.typed marker so it's
+exempted via `[[tool.mypy.overrides]]`, not left as a standing error.
+Deliberately excludes `tests/fuzz` (below) — that's about finding new bugs
+over many runs, not regression-guarding a specific change, so it stays a
+manual/opt-in step, not a per-commit one. Run `scripts/check.sh` by hand
+any time without committing.
 
 **Fuzz/property tests** (`tests/fuzz/`) target the three places arbitrary,
 possibly-adversarial input reaches a parser before anything gets close to

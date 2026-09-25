@@ -24,7 +24,13 @@ from ftw.protocol import (
     ResultEnvelope,
     ResultPayload,
 )
-from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse, ToolCall
+from ftw.providers import (
+    ChatMessage,
+    ChatRole,
+    MockModelProvider,
+    ProviderResponse,
+    ToolCall,
+)
 from ftw.runtime import inproc_address
 from ftw.skills.registry import SkillStore
 from ftw.skills.runner import SkillRunnerWorker

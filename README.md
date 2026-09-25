@@ -100,6 +100,8 @@ through the format and includes a couple of worked examples — mount it
 
 ```bash
 uv run pytest                                       # full suite, a few seconds
+scripts/check.sh                                    # the commit gate by hand: lint, types, tests
+git config core.hooksPath .githooks                 # one-time: run the gate on every commit
 uv run scripts/export_schemas.py                    # regenerate schemas/*.schema.json after touching protocol.py
 uv sync --group fuzz && uv run pytest tests/fuzz     # opt-in fuzz/property tests (see CLAUDE.md's Testing section)
 ```

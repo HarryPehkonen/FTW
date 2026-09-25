@@ -20,7 +20,14 @@ import time
 
 import pytest
 
-from ftw.bus import DeadlineExceeded, DispatchRouter, Publisher, Replier, Requester, Subscriber
+from ftw.bus import (
+    DeadlineExceeded,
+    DispatchRouter,
+    Publisher,
+    Replier,
+    Requester,
+    Subscriber,
+)
 from ftw.protocol import (
     AnswerEnvelope,
     AnswerPayload,
@@ -98,9 +105,8 @@ class TestDeadlineHandling:
 
         with Replier(addr) as rep:
             task = start_server(rep, slow_handler, stop)
-            with Requester(addr) as req:
-                with pytest.raises(DeadlineExceeded):
-                    await req.call(make_call(), timeout_ms=100)
+            with Requester(addr) as req, pytest.raises(DeadlineExceeded):
+                await req.call(make_call(), timeout_ms=100)
             stop.set()
         await task
 

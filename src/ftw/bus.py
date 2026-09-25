@@ -34,8 +34,9 @@ Design notes, matched to decisions made while planning:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Self
 
 import pynng
 from pydantic import ValidationError
@@ -119,7 +120,7 @@ class Requester:
     def close(self) -> None:
         self._socket.close()
 
-    def __enter__(self) -> "Requester":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info) -> None:
@@ -146,18 +147,15 @@ class _IdempotencyCache:
     async def get_or_compute(self, key: str, compute: Callable[[], Awaitable[bytes]]) -> bytes:
         if key in self._done:
             return self._done[key]
-        event = self._inflight.get(key)
-        owner = event is None
-        if owner:
-            event = asyncio.Event()
-            self._inflight[key] = event
-
-        if not owner:
-            await event.wait()
+        existing = self._inflight.get(key)
+        if existing is not None:
+            await existing.wait()
             if key in self._done:
                 return self._done[key]
             raise RuntimeError(f"idempotent call for key {key!r} failed in the owning task")
 
+        event = asyncio.Event()
+        self._inflight[key] = event
         try:
             result = await compute()
         except BaseException:
@@ -228,7 +226,7 @@ class Replier:
                     continue  # malformed on the wire; drop rather than crash the worker
                 try:
                     reply_bytes = await self._handle(envelope, handler)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - see the comment below for why this must stay blind
                     # A handler bug (or an upstream failure it didn't catch
                     # — a ProviderError, a UnicodeDecodeError on binary
                     # subprocess output, ...) must not take this whole
@@ -262,7 +260,7 @@ class Replier:
         if stale_path is not None and stale_path.exists():
             stale_path.unlink()
 
-    def __enter__(self) -> "Replier":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info) -> None:
@@ -303,7 +301,7 @@ class Publisher:
     def close(self) -> None:
         self._socket.close()
 
-    def __enter__(self) -> "Publisher":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info) -> None:
@@ -339,7 +337,7 @@ class Subscriber:
     def close(self) -> None:
         self._socket.close()
 
-    def __enter__(self) -> "Subscriber":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc_info) -> None:

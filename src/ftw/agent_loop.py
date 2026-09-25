@@ -100,12 +100,19 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 from uuid import uuid4
 
 from ftw.bus import DeadlineExceeded
-from ftw.frames import FrameBudgetExceeded, FrameNotFound, FramePinned, FrameTree, SkillAlreadyMounted
+from ftw.frames import (
+    FrameBudgetExceeded,
+    FrameNotFound,
+    FramePinned,
+    FrameTree,
+    SkillAlreadyMounted,
+)
 from ftw.intercept import InterceptDecision, PreCommitInterceptor
 from ftw.outputs import OutputNotFound, OutputStore
 from ftw.protocol import (
@@ -124,7 +131,14 @@ from ftw.protocol import (
     ResultEnvelope,
     ResultPayload,
 )
-from ftw.providers import ChatMessage, ChatRole, IModelProvider, ProviderError, ToolCall, ToolSpec
+from ftw.providers import (
+    ChatMessage,
+    ChatRole,
+    IModelProvider,
+    ProviderError,
+    ToolCall,
+    ToolSpec,
+)
 from ftw.skills.manifest import SkillParseError
 from ftw.skills.registry import SkillNotFound
 from ftw.workbench import ContextWorkbench, WorkbenchBudgetExceeded
@@ -175,6 +189,7 @@ class _Asker:
         return await self._answer
 
     def answer(self, value: Any) -> None:
+        assert self._answer is not None, "answer() called before ask() ever suspended"
         self._ask_seen.clear()
         self._answer.set_result(value)
 
@@ -188,7 +203,7 @@ class DelegatedSuspension:
     the state."""
 
     ask: AskEnvelope
-    _task: "asyncio.Task[ResultPayload]"
+    _task: asyncio.Task[ResultPayload]
     _asker: _Asker
     _cancel_flag: CancelFlag | None = None
 
@@ -413,13 +428,14 @@ class AgentLoop:
         return await self._drive_delegated(suspension._task, suspension._asker, cancel_flag=suspension._cancel_flag)
 
     async def _drive_delegated(
-        self, task: "asyncio.Task[ResultPayload]", asker: _Asker, *, cancel_flag: CancelFlag | None
+        self, task: asyncio.Task[ResultPayload], asker: _Asker, *, cancel_flag: CancelFlag | None
     ) -> ResultPayload | DelegatedSuspension:
         ask_seen = asyncio.ensure_future(asker._ask_seen.wait())
         done, _pending = await asyncio.wait({task, ask_seen}, return_when=asyncio.FIRST_COMPLETED)
         if task in done:
             ask_seen.cancel()
             return await task
+        assert asker.pending is not None, "ask_seen fired, so ask() must have recorded a pending envelope"
         return DelegatedSuspension(ask=asker.pending, _task=task, _asker=asker, _cancel_flag=cancel_flag)
 
     # -- the shared step loop --------------------------------------------
@@ -535,6 +551,7 @@ class AgentLoop:
         target = FRAME_TOOL_TARGET if executor is not None else self._tool_targets.get(tool_call.name)
         if executor is None and target is None:
             return f"error: unknown tool {tool_call.name!r}"
+        assert target is not None  # either FRAME_TOOL_TARGET or a registered tool target, never both unset here
 
         call = CallEnvelope(
             source=self._source_id,
@@ -664,7 +681,7 @@ class AgentLoop:
                     payload=CancelPayload(target_span_id=call.span_id, reason="Ctrl-C"),
                 )
             )
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best-effort notification; the Ctrl-C itself still ends the turn either way
             pass
 
     @staticmethod
@@ -734,6 +751,7 @@ class AgentLoop:
     # -- frame tools (find_skill / mount_skill / unmount_skill) -----------
 
     async def _handle_find_skill(self, args: dict[str, Any]) -> str:
+        assert self.frame_tree is not None  # only registered as a tool when a frame_tree was given
         query = args.get("query")
         if not query:
             return "error: find_skill requires 'query'"
@@ -744,6 +762,7 @@ class AgentLoop:
         return ", ".join(results) if results else "(no matching skills)"
 
     async def _handle_mount_skill(self, args: dict[str, Any]) -> str:
+        assert self.frame_tree is not None  # only registered as a tool when a frame_tree was given
         name = args.get("name")
         if not name:
             return "error: mount_skill requires 'name'"
@@ -754,6 +773,7 @@ class AgentLoop:
         return f"mounted {frame.skill_name!r}"
 
     async def _handle_unmount_skill(self, args: dict[str, Any]) -> str:
+        assert self.frame_tree is not None  # only registered as a tool when a frame_tree was given
         name = args.get("name")
         try:
             milestone = await self.frame_tree.unmount(name, by="model") if name else await self.frame_tree.unmount_focused(by="model")

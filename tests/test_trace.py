@@ -64,7 +64,7 @@ class TestTraceWriter:
     def test_defaults_to_todays_date(self, tmp_path):
         writer = TraceWriter(tmp_path)
         path = writer.write(event("trace-1"))
-        assert path.parent.name == datetime.date.today().isoformat()
+        assert path.parent.name == datetime.datetime.now().astimezone().date().isoformat()
 
     def test_concurrent_writes_do_not_interleave_or_corrupt_lines(self, tmp_path):
         writer = TraceWriter(tmp_path)

@@ -23,13 +23,24 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "mypy>=2.3.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.4.0",
+    "ruff>=0.16.9",
+    "types-pyyaml>=6.0.12.20260906",
 ]
 fuzz = [
     "hypothesis>=6.168.1",
 ]
+
+[tool.mypy]
+python_version = "3.14"
+files = ["src/ftw"]
+
+[[tool.mypy.overrides]]
+module = "pynng.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

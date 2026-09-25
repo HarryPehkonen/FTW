@@ -46,7 +46,8 @@ from __future__ import annotations
 import asyncio
 import signal
 import sys
-from typing import Any, Callable, TextIO
+from collections.abc import Callable
+from typing import Any, TextIO
 
 from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameError

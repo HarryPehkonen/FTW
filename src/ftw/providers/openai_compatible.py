@@ -6,6 +6,7 @@ all speak this same wire format (ftw_plan.md §6).
 from __future__ import annotations
 
 import json
+from typing import Self
 
 import httpx
 
@@ -28,7 +29,7 @@ class OpenAICompatibleProvider(IModelProvider):
         api_key: str | None,
         model: str,
         timeout_s: float = 60.0,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._model = model
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -68,7 +69,7 @@ class OpenAICompatibleProvider(IModelProvider):
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "OpenAICompatibleProvider":
+    async def __aenter__(self) -> Self:
         return self
 
     async def __aexit__(self, *exc_info) -> None:

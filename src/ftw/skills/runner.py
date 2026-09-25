@@ -41,7 +41,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from typing import Callable
+from collections.abc import Callable
 
 from ftw.agent_loop import AgentLoop, DelegatedSuspension, Dispatch
 from ftw.bus import Replier, Requester
@@ -77,7 +77,7 @@ class _PendingAsk:
     """What's stashed, keyed by resume_token, between an AskEnvelope going
     out and its matching AnswerEnvelope coming back."""
 
-    __slots__ = ("loop", "suspension", "original_call", "span_id")
+    __slots__ = ("loop", "original_call", "span_id", "suspension")
 
     def __init__(self, loop: AgentLoop, suspension: DelegatedSuspension, original_call: CallEnvelope, span_id: str):
         self.loop = loop
@@ -112,6 +112,8 @@ class SkillRunnerWorker:
     async def handle(self, envelope: AnyEnvelope) -> ResultEnvelope | ErrorEnvelope | AskEnvelope:
         if isinstance(envelope, AnswerEnvelope):
             return await self._handle_answer(envelope)
+        if not isinstance(envelope, CallEnvelope):
+            return self._error(envelope, "unsupported_action", f"call channel only accepts CALL/ANSWER, got {envelope.type.value}")
         return await self._handle_call(envelope)
 
     async def handle_cancel(self, envelope: AnyEnvelope) -> ResultEnvelope | ErrorEnvelope:
@@ -222,12 +224,12 @@ class SkillRunnerWorker:
         return f"{brief}\n\nInputs:\n{input_lines}"
 
     @staticmethod
-    def _error(call: CallEnvelope, code: str, message: str) -> ErrorEnvelope:
+    def _error(envelope: AnyEnvelope, code: str, message: str) -> ErrorEnvelope:
         return ErrorEnvelope(
-            source=call.target,
-            target=call.source,
-            parent_span_id=call.span_id,
-            trace_id=call.trace_id,
+            source=envelope.target,
+            target=envelope.source,
+            parent_span_id=envelope.span_id,
+            trace_id=envelope.trace_id,
             payload=ErrorPayload(code=code, message=message),
         )
 

@@ -54,7 +54,7 @@ verify:
 
 class TestParseSkillMd:
     def test_parses_frontmatter_into_a_manifest(self):
-        manifest, body = parse_skill_md(VALID_SKILL_MD)
+        manifest, _body = parse_skill_md(VALID_SKILL_MD)
 
         assert isinstance(manifest, SkillManifest)
         assert manifest.name == "cmake.diagnose_configure"

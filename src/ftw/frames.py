@@ -19,8 +19,9 @@ and a user who wants a fresh top-level mount instead just runs `/focus`
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Literal
+from typing import Literal
 from uuid import uuid4
 
 from ftw.providers import ChatMessage, ChatRole, IModelProvider
@@ -115,7 +116,7 @@ def make_llm_summarizer(provider: IModelProvider) -> Summarizer:
         ]
         try:
             response = await provider.complete(prompt)
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort summary; caller falls back to _deterministic_summary
             return None
         text = (response.message.content or "").strip()
         return text or None
@@ -215,7 +216,7 @@ class FrameTree:
         if self._summarizer is not None:
             try:
                 result = await self._summarizer(manifest, _render_transcript(turns))
-            except Exception:
+            except Exception:  # noqa: BLE001 - best-effort summary; falls through to _deterministic_summary below
                 result = None
             if result:
                 return result

@@ -21,7 +21,7 @@ class TraceWriter:
         self._lock = threading.Lock()
 
     def write(self, envelope: EventEnvelope, *, when: datetime.date | None = None) -> Path:
-        day = (when or datetime.date.today()).isoformat()
+        day = (when or datetime.datetime.now().astimezone().date()).isoformat()
         path = self._root / day / f"{envelope.trace_id}.jsonl"
         line = dump_envelope(envelope).decode("utf-8") + "\n"
         with self._lock:

@@ -18,7 +18,14 @@ import time
 
 from ftw.bus import Replier
 from ftw.outputs import OutputStore, build_excerpt
-from ftw.protocol import CallEnvelope, ErrorEnvelope, ErrorPayload, ResultEnvelope, ResultPayload
+from ftw.protocol import (
+    AnyEnvelope,
+    CallEnvelope,
+    ErrorEnvelope,
+    ErrorPayload,
+    ResultEnvelope,
+    ResultPayload,
+)
 from ftw.runtime import ipc_address
 
 
@@ -28,7 +35,10 @@ class ShellToolWorker:
         self._default_timeout_s = timeout_s
         self._default_cwd = cwd
 
-    async def handle(self, call: CallEnvelope) -> ResultEnvelope | ErrorEnvelope:
+    async def handle(self, envelope: AnyEnvelope) -> ResultEnvelope | ErrorEnvelope:
+        if not isinstance(envelope, CallEnvelope):
+            return self._error(envelope, "unsupported_action", f"shell worker only accepts CALL, got {envelope.type.value}")
+        call = envelope
         if call.payload.action != "run_command":
             return self._error(call, "unsupported_action", f"unsupported action: {call.payload.action!r}")
 
@@ -86,11 +96,11 @@ class ShellToolWorker:
         )
 
     @staticmethod
-    def _error(call: CallEnvelope, code: str, message: str) -> ErrorEnvelope:
+    def _error(envelope: AnyEnvelope, code: str, message: str) -> ErrorEnvelope:
         return ErrorEnvelope(
-            source=call.target,
-            target=call.source,
-            parent_span_id=call.span_id,
+            source=envelope.target,
+            target=envelope.source,
+            parent_span_id=envelope.span_id,
             payload=ErrorPayload(code=code, message=message),
         )
 
