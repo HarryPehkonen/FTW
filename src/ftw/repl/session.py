@@ -52,6 +52,7 @@ from typing import Any, TextIO
 from ftw.agent_loop import AgentLoop
 from ftw.frames import FrameError
 from ftw.protocol import AskEnvelope
+from ftw.sessions import DEFAULT_SESSION_NAME, SessionNotFound, SessionStore
 from ftw.skills.registry import SkillNotFound
 
 InputFn = Callable[[str], str]
@@ -66,6 +67,8 @@ _COMMAND_HELP: list[tuple[str, str]] = [
     ("/unmount [skill]", "Unmounts a skill (or, with no name, whichever is focused), distilling its work into a milestone."),
     ("/focus [skill]", "Switches which mounted skill new turns and mounts attach to; no argument returns focus to the root session."),
     ("/frames", "Shows the mounted-skill tree."),
+    ("/save [name]", "Saves the current conversation to disk (default name: 'latest')."),
+    ("/load [name]", "Loads a previously saved conversation, replacing the current one (default name: 'latest')."),
     ("/exit", "Quits."),
 ]
 
@@ -142,11 +145,13 @@ class ReplSession:
         input_fn: InputFn,
         output: TextIO = sys.stdout,
         prompt: str = "ftw> ",
+        session_store: SessionStore | None = None,
     ):
         self.agent_loop = agent_loop
         self._input_fn = input_fn
         self._output = output
         self._prompt = prompt
+        self._session_store = session_store
 
     async def run(self) -> None:
         while True:
@@ -226,6 +231,10 @@ class ReplSession:
             return await self._cmd_focus(parts)
         if cmd == "/frames":
             return self._cmd_frames()
+        if cmd == "/save":
+            return self._cmd_save(parts)
+        if cmd == "/load":
+            return await self._cmd_load(parts)
 
         self._print(f"unknown command: {cmd} (try /help)")
         return True
@@ -285,6 +294,39 @@ class ReplSession:
             self._print("no skill store configured")
             return True
         self._print(self.agent_loop.frame_tree.render_tree())
+        return True
+
+    # -- session save/load commands (ftw_plan.md §3.6) ---------------------
+
+    def _cmd_save(self, parts: list[str]) -> bool:
+        if self._session_store is None:
+            self._print("no session store configured")
+            return True
+        name = parts[1].strip() if len(parts) > 1 else DEFAULT_SESSION_NAME
+        path = self._session_store.save(self.agent_loop.workbench, self.agent_loop.frame_tree, name)
+        self._print(f"saved session {name!r} ({path})")
+        return True
+
+    async def _cmd_load(self, parts: list[str]) -> bool:
+        if self._session_store is None:
+            self._print("no session store configured")
+            return True
+        name = parts[1].strip() if len(parts) > 1 else DEFAULT_SESSION_NAME
+        try:
+            result = await self._session_store.load(self.agent_loop.workbench, self.agent_loop.frame_tree, name)
+        except SessionNotFound:
+            names = self._session_store.list_names()
+            if names:
+                self._print(f"no saved session named {name!r}. available: {', '.join(names)}")
+            else:
+                self._print(f"no saved session named {name!r}: nothing has been saved yet")
+            return True
+        message = f"loaded session {name!r} ({result.turn_count} turn(s))"
+        if result.mounted_skills:
+            message += f"; remounted: {', '.join(result.mounted_skills)}"
+        if result.failed_skills:
+            message += f"; skills not loaded: {', '.join(result.failed_skills)}"
+        self._print(message)
         return True
 
     def _cmd_help(self) -> bool:

@@ -42,6 +42,8 @@ uv run ftw tap                                # in another terminal: stream live
 | `/unmount [skill]` | Unmounts a skill (or, with no name, whichever is focused), distilling its work into a milestone. |
 | `/focus [skill]` | Switches which mounted skill new turns and mounts attach to; no argument returns focus to the root session. |
 | `/frames` | Shows the mounted-skill tree. |
+| `/save [name]` | Saves the current conversation to disk (default name: `latest`). |
+| `/load [name]` | Loads a previously saved conversation, replacing the current one (default name: `latest`). |
 | `/exit` | Quits. |
 
 The model can also find, mount, and unmount skills itself (`find_skill`,

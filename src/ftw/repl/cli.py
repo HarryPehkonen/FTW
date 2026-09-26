@@ -28,6 +28,7 @@ from ftw.outputs import OutputStore
 from ftw.providers import IModelProvider
 from ftw.repl.session import InputFn, ReplSession, make_ask_answerer
 from ftw.runtime import ipc_address
+from ftw.sessions import SessionStore
 from ftw.skills.registry import SkillStore
 from ftw.skills.runner import control_address as skill_runner_control_address
 from ftw.trace import TraceWriter
@@ -235,7 +236,8 @@ async def build_repl_session(
         skill_runner_target=SKILL_RUNNER_TARGET,
         on_event=on_event,
     )
-    session = ReplSession(agent_loop=loop, input_fn=input_fn, output=output)
+    session_store = SessionStore(ftw_home / "sessions")
+    session = ReplSession(agent_loop=loop, input_fn=input_fn, output=output, session_store=session_store)
 
     return ReplHandle(
         session=session,

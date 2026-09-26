@@ -369,6 +369,75 @@ class TestMakeLlmSummarizer:
         assert "run_command" in milestone
 
 
+class TestMountedFrames:
+    """sessions.py's save() needs the current mount structure in a form it
+    can serialize — this is that accessor, exposing what's already tracked
+    internally (_frames' insertion order) without exposing _frames itself."""
+
+    async def test_empty_tree_returns_empty_list(self, tree):
+        assert tree.mounted_frames() == []
+
+    async def test_returns_frames_in_mount_order_parent_before_child(self, tree):
+        parent = await tree.mount("cmake.diagnose_configure", owner="user")
+        child = await tree.mount("toolchain.verify_installed", owner="model")
+
+        frames = tree.mounted_frames()
+
+        assert [f.id for f in frames] == [parent.id, child.id]
+
+    async def test_unmounted_frames_are_not_included(self, tree):
+        await tree.mount("cmake.diagnose_configure")
+        await tree.mount("toolchain.verify_installed")
+        await tree.unmount("toolchain.verify_installed", by="user")
+
+        assert [f.skill_name for f in tree.mounted_frames()] == ["cmake.diagnose_configure"]
+
+
+class TestClear:
+    """A hard reset, with no distillation — unlike unmount(), which always
+    produces a milestone. Used only by sessions.py's load(), which is about
+    to replace the whole frame tree wholesale, so there's nothing here
+    worth summarizing."""
+
+    async def test_clears_every_mounted_frame_and_the_mounted_skill_text(self, tree, workbench):
+        await tree.mount("cmake.diagnose_configure")
+        await tree.mount("toolchain.verify_installed")
+
+        tree.clear()
+
+        assert tree.mounted_frames() == []
+        assert workbench.mounted_skill_tokens == 0
+
+    async def test_clears_focus(self, tree):
+        await tree.mount("cmake.diagnose_configure")
+
+        tree.clear()
+
+        assert tree.focused_skill_name is None
+        assert tree.focused_frame_id is None
+
+    async def test_does_not_touch_turns_or_milestones(self, tree, workbench):
+        parent = await tree.mount("cmake.diagnose_configure")
+        workbench.add_turn([user("hi")], frame_id=parent.id)
+        workbench.add_milestone("unrelated prior milestone")
+
+        tree.clear()
+
+        assert workbench.turns == [[user("hi")]]  # clear() doesn't evict — sessions.py calls workbench.reset() separately
+        assert workbench.milestones == ["unrelated prior milestone"]
+
+    def test_clear_on_an_already_empty_tree_is_a_no_op(self, tree):
+        tree.clear()  # must not raise
+        assert tree.mounted_frames() == []
+
+    async def test_a_pinned_frame_does_not_block_clear(self, tree):
+        await tree.mount("cmake.diagnose_configure", pinned=True)
+
+        tree.clear()  # must not raise FramePinned - clear() bypasses the pinned-frame protection entirely
+
+        assert tree.mounted_frames() == []
+
+
 class TestFindAndRenderTree:
     def test_find_delegates_to_the_skill_store(self, tree):
         assert tree.find("cmake configuration")[0][0] == "cmake.diagnose_configure"

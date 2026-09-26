@@ -191,6 +191,15 @@ class ContextWorkbench:
             evicted = self._turns.pop(0)
             self._fire_turn_evicted(evicted.messages)
 
+    def reset(self) -> None:
+        """Clears turns, milestones, and the scratchpad in one go — used
+        when a previously saved session is loaded (sessions.py), so the
+        load starts from a clean slate instead of appending on top of
+        whatever's already here."""
+        self.clear_turns()
+        self._milestones = []
+        self._scratchpad = {}
+
     def evict_frame(self, frame_id: str) -> list[list[ChatMessage]]:
         """Removes every message tagged with ``frame_id``, wherever it
         appears — a turn that becomes empty is dropped entirely; one that
@@ -217,6 +226,13 @@ class ContextWorkbench:
     @property
     def turns(self) -> list[list[ChatMessage]]:
         return [list(record.messages) for record in self._turns]
+
+    @property
+    def tagged_turns(self) -> list[list[tuple[str | None, ChatMessage]]]:
+        """Like ``turns``, but keeps each message's frame_id — sessions.py
+        needs this to translate the (process-lifetime, not stable across a
+        restart) frame id into a portable skill_name label when saving."""
+        return [[(tm.frame_id, tm.message) for tm in record.tagged] for record in self._turns]
 
     @property
     def turn_horizon_tokens(self) -> int:
@@ -251,6 +267,12 @@ class ContextWorkbench:
     @property
     def scratchpad(self) -> dict[str, str]:
         return {k: r.value for k, r in self._scratchpad.items()}
+
+    @property
+    def tagged_scratchpad(self) -> dict[str, tuple[str | None, str]]:
+        """Like ``scratchpad``, but keeps each pin's frame_id — see
+        ``tagged_turns`` for why sessions.py needs this."""
+        return {k: (r.frame_id, r.value) for k, r in self._scratchpad.items()}
 
     @property
     def scratchpad_tokens(self) -> int:

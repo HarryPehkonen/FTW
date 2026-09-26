@@ -133,6 +133,35 @@ class TestTurnHorizon:
         assert len(evicted) == 2
 
 
+class TestReset:
+    def test_reset_clears_turns_milestones_and_scratchpad(self):
+        wb = ContextWorkbench()
+        wb.add_turn([user("hi")])
+        wb.add_milestone("did a thing")
+        wb.pin("key", "value")
+
+        wb.reset()
+
+        assert wb.turns == []
+        assert wb.milestones == []
+        assert wb.scratchpad == {}
+
+    def test_reset_fires_turn_evicted_callback_for_existing_turns(self):
+        evicted = []
+        wb = ContextWorkbench(on_turn_evicted=evicted.append)
+        wb.add_turn([user("a")])
+        wb.add_turn([user("b")])
+
+        wb.reset()
+
+        assert len(evicted) == 2
+
+    def test_reset_on_an_already_empty_workbench_is_a_no_op(self):
+        wb = ContextWorkbench()
+        wb.reset()  # must not raise
+        assert wb.turns == []
+
+
 class TestRenderPrompt:
     def test_zone_order_in_system_message(self):
         wb = ContextWorkbench(system_anchor="ANCHOR", user_memory="MEMORY")
@@ -311,6 +340,28 @@ class TestPerMessageTagging:
         wb = ContextWorkbench()
         wb.add_turn([user("a"), assistant("b")], frame_id="f1")
         assert wb.evict_frame("f1") == [[user("a"), assistant("b")]]
+
+
+class TestTaggedAccessors:
+    """sessions.py needs the frame_id tags .turns/.scratchpad strip away,
+    to translate them into portable skill_name labels for a saved session
+    (frame ids are process-lifetime UUIDs, not stable across a restart)."""
+
+    def test_tagged_turns_exposes_the_frame_id_per_message(self):
+        wb = ContextWorkbench()
+        wb.add_tagged_turn([(None, user("hi")), ("f1", assistant("mounted and worked"))])
+
+        assert wb.tagged_turns == [[(None, user("hi")), ("f1", assistant("mounted and worked"))]]
+
+    def test_tagged_turns_on_an_empty_workbench(self):
+        assert ContextWorkbench().tagged_turns == []
+
+    def test_tagged_scratchpad_exposes_the_frame_id_per_pin(self):
+        wb = ContextWorkbench()
+        wb.pin("base", "b")  # frame_id defaults to None
+        wb.pin("mine", "m", frame_id="f1")
+
+        assert wb.tagged_scratchpad == {"base": (None, "b"), "mine": ("f1", "m")}
 
     def test_partial_eviction_still_fires_on_turn_evicted_with_just_the_evicted_messages(self):
         evicted = []

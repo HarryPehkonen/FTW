@@ -23,6 +23,7 @@ from ftw.outputs import OutputStore
 from ftw.protocol import AskEnvelope, AskPayload
 from ftw.providers import ChatMessage, ChatRole, MockModelProvider, ProviderResponse
 from ftw.repl.session import ReplSession, make_ask_answerer
+from ftw.sessions import SessionStore
 from ftw.skills.registry import SkillStore
 from ftw.workbench import ContextWorkbench
 
@@ -55,7 +56,9 @@ class ScriptedInput:
         return self._lines.pop(0)
 
 
-def make_session(responses: list[ProviderResponse], lines: list[str], tmp_path) -> tuple[ReplSession, io.StringIO]:
+def make_session(
+    responses: list[ProviderResponse], lines: list[str], tmp_path, *, session_store: SessionStore | None = None
+) -> tuple[ReplSession, io.StringIO]:
     loop = AgentLoop(
         workbench=ContextWorkbench(system_anchor="be terse"),
         provider=MockModelProvider(responses),
@@ -63,7 +66,7 @@ def make_session(responses: list[ProviderResponse], lines: list[str], tmp_path) 
         dispatch=async_raising(AssertionError("should not dispatch")),
     )
     out = io.StringIO()
-    session = ReplSession(agent_loop=loop, input_fn=ScriptedInput(lines), output=out)
+    session = ReplSession(agent_loop=loop, input_fn=ScriptedInput(lines), output=out, session_store=session_store)
     return session, out
 
 
@@ -121,7 +124,7 @@ class TestHelpCommand:
         text = out.getvalue()
         # every command /help itself documents must actually appear, each
         # with some descriptive text alongside it, not just a bare list
-        for cmd in ("/help", "/context", "/clear", "/mount", "/unmount", "/focus", "/frames", "/exit"):
+        for cmd in ("/help", "/context", "/clear", "/mount", "/unmount", "/focus", "/frames", "/save", "/load", "/exit"):
             assert cmd in text, f"{cmd!r} missing from /help output"
         assert "quit" in text.lower()  # spot-check that descriptions, not just names, are present
 
@@ -140,7 +143,9 @@ def write_skill(root, relpath: str, name: str, description: str, body: str = "do
     path.write_text(f"---\nname: {name}\ndescription: {description}\n---\n\n{body}\n")
 
 
-def make_session_with_frames(lines: list[str], tmp_path) -> tuple[ReplSession, io.StringIO]:
+def make_session_with_frames(
+    lines: list[str], tmp_path, *, session_store: SessionStore | None = None
+) -> tuple[ReplSession, io.StringIO]:
     write_skill(tmp_path, "cmake/diagnose_configure", "cmake.diagnose_configure", "Diagnose failing CMake configuration.")
     workbench = ContextWorkbench()
     tree = FrameTree(workbench, SkillStore(tmp_path))
@@ -152,7 +157,7 @@ def make_session_with_frames(lines: list[str], tmp_path) -> tuple[ReplSession, i
         frame_tree=tree,
     )
     out = io.StringIO()
-    return ReplSession(agent_loop=loop, input_fn=ScriptedInput(lines), output=out), out
+    return ReplSession(agent_loop=loop, input_fn=ScriptedInput(lines), output=out, session_store=session_store), out
 
 
 class TestMountCommands:
@@ -247,6 +252,138 @@ class TestFramesCommand:
         session, out = make_session_with_frames(["/frames", "/exit"], tmp_path)
         await session.run()
         assert "nothing mounted" in out.getvalue().lower()
+
+
+class TestSaveLoadCommands:
+    async def test_save_then_load_in_a_fresh_session_restores_the_conversation(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        session, out = make_session([assistant("hi there")], ["hello", "/save", "/exit"], tmp_path, session_store=store)
+        await session.run()
+        assert "saved session" in out.getvalue().lower()
+
+        new_session, new_out = make_session([], ["/load", "/exit"], tmp_path, session_store=store)
+        await new_session.run()
+
+        assert "loaded session" in new_out.getvalue().lower()
+        assert len(new_session.agent_loop.workbench.turns) == 1
+        assert new_session.agent_loop.workbench.turns[0][0].content == "hello"
+
+    async def test_save_and_load_accept_a_name(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        session, out = make_session([assistant("ok")], ["work in progress", "/save wip", "/exit"], tmp_path, session_store=store)
+        await session.run()
+        assert "wip" in out.getvalue()
+
+        new_session, _new_out = make_session([], ["/load wip", "/exit"], tmp_path, session_store=store)
+        await new_session.run()
+        assert len(new_session.agent_loop.workbench.turns) == 1
+
+    async def test_load_replaces_rather_than_appends_to_the_current_conversation(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        saved, _ = make_session([assistant("saved reply")], ["saved turn", "/save", "/exit"], tmp_path, session_store=store)
+        await saved.run()
+
+        # "current turn" is run and committed to the workbench *before* /load
+        # fires; /load must wipe it out, not append the saved turn after it.
+        current, _ = make_session([assistant("current reply")], ["current turn", "/load", "/exit"], tmp_path, session_store=store)
+        await current.run()
+
+        assert len(current.agent_loop.workbench.turns) == 1
+        assert current.agent_loop.workbench.turns[0][0].content == "saved turn"
+
+    async def test_load_missing_session_reports_it_has_nothing_to_load(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        session, out = make_session([], ["/load", "/exit"], tmp_path, session_store=store)
+        await session.run()
+        assert "no saved session" in out.getvalue().lower()
+
+    async def test_load_missing_named_session_lists_what_is_available(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        setup, _ = make_session([assistant("ok")], ["hi", "/save known", "/exit"], tmp_path, session_store=store)
+        await setup.run()
+
+        session, out = make_session([], ["/load bogus", "/exit"], tmp_path, session_store=store)
+        await session.run()
+
+        assert "known" in out.getvalue()
+
+    async def test_commands_without_a_session_store_report_no_session_store(self, tmp_path):
+        session, out = make_session([], ["/save", "/load", "/exit"], tmp_path, session_store=None)
+        await session.run()  # must not raise
+        assert out.getvalue().lower().count("no session store configured") == 2
+
+
+class TestSaveLoadRemountsSkills:
+    """The end-to-end path for the frame-fidelity design: a skill mounted
+    through the real /mount command comes back mounted through the real
+    /load command, with its history correctly attributed to it — not just
+    approximated. This is the REPL-level counterpart to test_sessions.py's
+    TestFrameFidelity, exercising the same behavior through the commands a
+    person actually types."""
+
+    async def test_a_mounted_skill_is_remounted_on_load_and_reported(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        session, _out = make_session_with_frames(
+            ["/mount cmake.diagnose_configure", "/save", "/exit"], tmp_path, session_store=store
+        )
+        await session.run()
+
+        new_session, new_out = make_session_with_frames(["/load", "/exit"], tmp_path, session_store=store)
+        await new_session.run()
+
+        assert "remounted: cmake.diagnose_configure" in new_out.getvalue()
+        assert new_session.agent_loop.frame_tree.focused_skill_name == "cmake.diagnose_configure"
+
+    async def test_unmounting_a_remounted_skill_produces_a_real_milestone_not_an_empty_one(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        session, _out = make_session_with_frames(
+            ["/mount cmake.diagnose_configure", "/save", "/exit"], tmp_path, session_store=store
+        )
+        await session.run()
+        # Simulate work having happened under the mounted skill before saving,
+        # by tagging a turn to its frame directly (the model would normally
+        # do this via ordinary tool calls while the skill has focus).
+        frame_id = session.agent_loop.frame_tree.focused_frame_id
+        session.agent_loop.workbench.add_turn(
+            [ChatMessage(role=ChatRole.USER, content="what's wrong with the configure step?")], frame_id=frame_id
+        )
+        store.save(session.agent_loop.workbench, session.agent_loop.frame_tree)
+
+        new_session, new_out = make_session_with_frames(
+            ["/load", "/unmount cmake.diagnose_configure", "/exit"], tmp_path, session_store=store
+        )
+        await new_session.run()
+
+        assert "no activity" not in new_out.getvalue().lower()
+
+    async def test_a_skill_removed_from_disk_before_load_is_reported_not_loaded(self, tmp_path):
+        store = SessionStore(tmp_path / "sessions")
+        session, _out = make_session_with_frames(
+            ["/mount cmake.diagnose_configure", "/save", "/exit"], tmp_path, session_store=store
+        )
+        await session.run()
+
+        # A different, empty skills dir for the second session — standing
+        # in for "the skill was renamed/removed on disk since the save" -
+        # rather than reusing make_session_with_frames, which would just
+        # rewrite the same skill back into tmp_path.
+        empty_skills_dir = tmp_path / "no_skills_here"
+        empty_skills_dir.mkdir()
+        workbench = ContextWorkbench()
+        tree = FrameTree(workbench, SkillStore(empty_skills_dir))
+        loop = AgentLoop(
+            workbench=workbench,
+            provider=MockModelProvider([]),
+            output_store=OutputStore(tmp_path / "outputs2"),
+            dispatch=async_raising(AssertionError("should not dispatch")),
+            frame_tree=tree,
+        )
+        new_out = io.StringIO()
+        new_session = ReplSession(agent_loop=loop, input_fn=ScriptedInput(["/load", "/exit"]), output=new_out, session_store=store)
+
+        await new_session.run()
+
+        assert "skills not loaded: cmake.diagnose_configure" in new_out.getvalue()
 
 
 class TestMakeAskAnswerer:

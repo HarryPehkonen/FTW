@@ -254,6 +254,26 @@ class FrameTree:
     def find(self, query: str, *, top_k: int = 5) -> list[tuple[str, str]]:
         return self._skills.find(query, top_k=top_k)
 
+    def mounted_frames(self) -> list[Frame]:
+        """Every currently mounted frame, in mount order — a parent always
+        precedes its children, since a frame can only ever nest under one
+        that's already mounted. sessions.py uses this to serialize the
+        current mount structure; nothing else needs frames in bulk like
+        this today."""
+        return list(self._frames.values())
+
+    def clear(self) -> None:
+        """Hard-resets every mounted frame — no summarizer call, no
+        milestone, no pinned-frame protection. Unlike unmount(), which
+        always distills a frame's work before removing it, this is for
+        when the frame tree is about to be replaced wholesale (sessions.py's
+        load()): the frames being cleared here aren't finishing, they're
+        being discarded in favor of whatever's being restored next, so
+        there's nothing here worth summarizing."""
+        self._frames = {}
+        self._focus_id = None
+        self._sync_mounted_text()
+
     def _find_by_skill(self, skill_name: str) -> Frame | None:
         return next((f for f in self._frames.values() if f.skill_name == skill_name), None)
 
