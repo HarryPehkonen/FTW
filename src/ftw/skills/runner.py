@@ -44,9 +44,9 @@ import sys
 from collections.abc import Callable
 
 from ftw.agent_loop import AgentLoop, DelegatedSuspension, Dispatch
-from ftw.bus import Replier, Requester
+from ftw.bus import DispatchRouter, Replier, Requester
 from ftw.config import build_provider, load_config
-from ftw.intercept import ConfirmShellCommands, PreCommitInterceptor
+from ftw.intercept import ConfirmFileEdits, ConfirmShellCommands, PreCommitInterceptor
 from ftw.outputs import OutputStore
 from ftw.protocol import (
     AnswerEnvelope,
@@ -238,12 +238,20 @@ def control_address(address: str) -> str:
     return f"{address}.ctl"
 
 
+# Logical target names a delegated run's own tool calls carry, matching
+# agent_loop.DEFAULT_TOOL_TARGETS exactly — same convention as repl/cli.py's
+# SHELL_WORKER_TARGET/EDIT_WORKER_TARGET.
+_SHELL_WORKER_TARGET = "worker.tool.shell"
+_EDIT_WORKER_TARGET = "worker.tool.edit"
+
+
 async def run_worker(
     address: str,
     *,
     skills_dir: str,
     output_root: str,
     shell_worker_address: str,
+    edit_worker_address: str,
     config_path: str,
     default_tier: str,
     catalog_dirs: list[str] | None = None,
@@ -257,16 +265,18 @@ async def run_worker(
     mount them too, not just the interactive REPL."""
     config = load_config(config_path)
     shell_requester = Requester(shell_worker_address)
+    edit_requester = Requester(edit_worker_address)
+    dispatch = DispatchRouter({_SHELL_WORKER_TARGET: shell_requester, _EDIT_WORKER_TARGET: edit_requester})
     worker = SkillRunnerWorker(
         SkillStore(skills_dir, catalog_dirs=catalog_dirs),
         provider_factory=lambda tier: build_provider(config, tier or default_tier),
         output_store=OutputStore(output_root),
-        dispatch=shell_requester.call,
+        dispatch=dispatch,
         # Same default policy as the interactive REPL (repl/cli.py) — safe
         # to enable now that ASK passthrough exists to relay a delegated
         # run's confirmation prompt back to a real human instead of it
         # just blocking forever with no one there to answer.
-        interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+        interceptor=PreCommitInterceptor([ConfirmShellCommands(), ConfirmFileEdits()]),
     )
     stop_event = stop_event or asyncio.Event()
     try:
@@ -281,6 +291,7 @@ async def run_worker(
                 tg.create_task(rep.serve_forever(worker.handle, stop_event))
     finally:
         shell_requester.close()
+        edit_requester.close()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -289,6 +300,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--skills-dir", default="skills")
     parser.add_argument("--output-root", default="outputs")
     parser.add_argument("--shell-worker-address", required=True)
+    parser.add_argument("--edit-worker-address", required=True)
     parser.add_argument("--config", default="ftw.toml")
     parser.add_argument("--default-tier", default="fast")
     parser.add_argument("--catalog-dir", action="append", dest="catalog_dirs", default=[])
@@ -301,6 +313,7 @@ def main(argv: list[str] | None = None) -> None:
                 skills_dir=args.skills_dir,
                 output_root=args.output_root,
                 shell_worker_address=args.shell_worker_address,
+                edit_worker_address=args.edit_worker_address,
                 config_path=args.config,
                 default_tier=args.default_tier,
                 catalog_dirs=args.catalog_dirs,

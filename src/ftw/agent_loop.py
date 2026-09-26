@@ -52,7 +52,7 @@ Three kinds of tool call a model can make, handled differently on purpose:
   arguments, not just the interceptor's reason) and only executes if the
   answer is exactly ``True``; ``BLOCK`` never executes and never asks. Two
   flavors:
-  - **Bus tools** (``run_command``, ``delegate_skill``) dispatched as a
+  - **Bus tools** (``run_command``, ``edit_file``, ``delegate_skill``) dispatched as a
     CALL over the bus, with a deadline comfortably longer than whatever
     they wrap (see ``DEFAULT_CALL_DEADLINES_MS``) — a ``DeadlineExceeded``
     or a real Ctrl-C (``asyncio.CancelledError``) during dispatch is
@@ -155,10 +155,13 @@ MAX_WORKER_ASK_ROUNDS = 10
 # Every CALL gets a deadline comfortably longer than whatever it wraps, so
 # a slow-but-legitimate command doesn't get mistaken for a hung one.
 # run_command: the shell worker's own default command timeout is 60s
-# (tools/shell.py). delegate_skill: a delegated run may need several
-# model round-trips plus its own tool calls, so it gets much more room.
+# (tools/shell.py). edit_file: a local temp-write-then-rename, generous
+# but nowhere near run_command's room since there's no subprocess to wait
+# on. delegate_skill: a delegated run may need several model round-trips
+# plus its own tool calls, so it gets much more room.
 DEFAULT_CALL_DEADLINES_MS: dict[str, int] = {
     "run_command": 65_000,
+    "edit_file": 15_000,
     "delegate_skill": 300_000,
 }
 FALLBACK_CALL_DEADLINE_MS = 30_000
@@ -238,6 +241,22 @@ BUILTIN_TOOL_SPECS: list[ToolSpec] = [
                 "cwd": {"type": "string"},
             },
             "required": ["argv"],
+        },
+    ),
+    ToolSpec(
+        name="edit_file",
+        description=(
+            "Replace an exact, unique occurrence of old_string with new_string in a file. "
+            "Refuses if old_string matches zero or more than one time."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "old_string": {"type": "string"},
+                "new_string": {"type": "string"},
+            },
+            "required": ["path", "old_string", "new_string"],
         },
     ),
     ToolSpec(
@@ -321,7 +340,7 @@ FRAME_TOOL_SPECS: list[ToolSpec] = [
     ),
 ]
 
-DEFAULT_TOOL_TARGETS: dict[str, str] = {"run_command": "worker.tool.shell"}
+DEFAULT_TOOL_TARGETS: dict[str, str] = {"run_command": "worker.tool.shell", "edit_file": "worker.tool.edit"}
 
 # The CallEnvelope.target for frame tools — there's no bus worker on the
 # other end (mounting mutates this session's own workbench in-process),

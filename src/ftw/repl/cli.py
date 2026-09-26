@@ -23,7 +23,7 @@ from ftw.agent_loop import AgentLoop
 from ftw.bus import DispatchRouter, Publisher, Requester
 from ftw.config import build_provider, load_config
 from ftw.frames import FrameTree, make_llm_summarizer
-from ftw.intercept import ConfirmShellCommands, PreCommitInterceptor
+from ftw.intercept import ConfirmFileEdits, ConfirmShellCommands, PreCommitInterceptor
 from ftw.outputs import OutputStore
 from ftw.providers import IModelProvider
 from ftw.repl.session import InputFn, ReplSession, make_ask_answerer
@@ -54,6 +54,7 @@ _WORKER_POLL_INTERVAL_S = 0.02
 # looked up by DispatchRouter — not the actual dynamic ipc:// address,
 # which changes on every run.
 SHELL_WORKER_TARGET = "worker.tool.shell"  # matches agent_loop.DEFAULT_TOOL_TARGETS
+EDIT_WORKER_TARGET = "worker.tool.edit"  # matches agent_loop.DEFAULT_TOOL_TARGETS
 SKILL_RUNNER_TARGET = "skill.runner"
 
 
@@ -81,12 +82,17 @@ def spawn_shell_worker(address: str, output_root: Path) -> subprocess.Popen:
     )
 
 
+def spawn_edit_worker(address: str) -> subprocess.Popen:
+    return subprocess.Popen([sys.executable, "-m", "ftw.tools.edit", "--address", address])
+
+
 def spawn_skill_runner_worker(
     address: str,
     *,
     skills_dir: Path,
     output_root: Path,
     shell_worker_address: str,
+    edit_worker_address: str,
     config_path: Path,
     default_tier: str,
     catalog_dirs: list[Path] | None = None,
@@ -103,6 +109,8 @@ def spawn_skill_runner_worker(
         str(output_root),
         "--shell-worker-address",
         shell_worker_address,
+        "--edit-worker-address",
+        edit_worker_address,
         "--config",
         str(config_path),
         "--default-tier",
@@ -146,6 +154,8 @@ class ReplHandle:
     session: ReplSession
     _shell_worker_proc: subprocess.Popen
     _shell_requester: Requester
+    _edit_worker_proc: subprocess.Popen
+    _edit_requester: Requester
     _skill_runner_proc: subprocess.Popen
     _skill_runner_requester: Requester
     _skill_runner_control_requester: Requester
@@ -153,10 +163,12 @@ class ReplHandle:
 
     def close(self) -> None:
         self._shell_requester.close()
+        self._edit_requester.close()
         self._skill_runner_requester.close()
         self._skill_runner_control_requester.close()
         self._publisher.close()
         _stop_worker(self._shell_worker_proc)
+        _stop_worker(self._edit_worker_proc)
         _stop_worker(self._skill_runner_proc)
 
 
@@ -171,6 +183,7 @@ async def build_repl_session(
     system_anchor: str = DEFAULT_SYSTEM_ANCHOR,
     skills_dir: Path | None = None,
     worker_address: str | None = None,
+    edit_worker_address: str | None = None,
     skill_runner_address: str | None = None,
     events_address: str | None = None,
     worker_startup_grace_s: float = DEFAULT_WORKER_STARTUP_GRACE_S,
@@ -193,12 +206,18 @@ async def build_repl_session(
     await _wait_for_worker_or_crash(shell_worker_proc, grace_s=worker_startup_grace_s, name="shell worker")
     shell_requester = Requester(shell_worker_address)
 
+    edit_worker_address = edit_worker_address or ipc_address(f"worker.tool.edit.{uuid4().hex[:8]}")
+    edit_worker_proc = spawn_edit_worker(edit_worker_address)
+    await _wait_for_worker_or_crash(edit_worker_proc, grace_s=worker_startup_grace_s, name="edit worker")
+    edit_requester = Requester(edit_worker_address)
+
     skill_runner_address = skill_runner_address or ipc_address(f"skill.runner.{uuid4().hex[:8]}")
     skill_runner_proc = spawn_skill_runner_worker(
         skill_runner_address,
         skills_dir=resolved_skills_dir,
         output_root=output_root,
         shell_worker_address=shell_worker_address,
+        edit_worker_address=edit_worker_address,
         config_path=resolved_config_path,
         default_tier=tier,
         catalog_dirs=catalog_dirs,
@@ -222,14 +241,16 @@ async def build_repl_session(
     skill_store = SkillStore(resolved_skills_dir, catalog_dirs=catalog_dirs)
     frame_tree = FrameTree(workbench, skill_store, summarizer=make_llm_summarizer(provider))
 
-    dispatch = DispatchRouter({SHELL_WORKER_TARGET: shell_requester, SKILL_RUNNER_TARGET: skill_runner_requester})
+    dispatch = DispatchRouter(
+        {SHELL_WORKER_TARGET: shell_requester, EDIT_WORKER_TARGET: edit_requester, SKILL_RUNNER_TARGET: skill_runner_requester}
+    )
 
     loop = AgentLoop(
         workbench=workbench,
         provider=provider,
         output_store=OutputStore(output_root),
         dispatch=dispatch,
-        interceptor=PreCommitInterceptor([ConfirmShellCommands()]),
+        interceptor=PreCommitInterceptor([ConfirmShellCommands(), ConfirmFileEdits()]),
         ask_answerer=make_ask_answerer(input_fn, output),
         control_dispatch=skill_runner_control_requester.call,
         frame_tree=frame_tree,
@@ -243,6 +264,8 @@ async def build_repl_session(
         session=session,
         _shell_worker_proc=shell_worker_proc,
         _shell_requester=shell_requester,
+        _edit_worker_proc=edit_worker_proc,
+        _edit_requester=edit_requester,
         _skill_runner_proc=skill_runner_proc,
         _skill_runner_requester=skill_runner_requester,
         _skill_runner_control_requester=skill_runner_control_requester,
@@ -278,6 +301,12 @@ def main(argv: list[str] | None = None) -> None:
         shell_worker_main(argv[1:])
         return
 
+    if argv[:1] == ["edit-worker"]:
+        from ftw.tools.edit import main as edit_worker_main
+
+        edit_worker_main(argv[1:])
+        return
+
     if argv[:1] == ["skill-runner"]:
         from ftw.skills.runner import main as skill_runner_main
 
@@ -289,7 +318,8 @@ def main(argv: list[str] | None = None) -> None:
         description="FTW REPL",
         epilog=(
             "Other subcommands: 'ftw tap' (stream live events), 'ftw shell-worker' "
-            "(run the shell worker standalone), 'ftw skill-runner' (run the delegated skill worker standalone)."
+            "(run the shell worker standalone), 'ftw edit-worker' (run the file-edit worker standalone), "
+            "'ftw skill-runner' (run the delegated skill worker standalone)."
         ),
     )
     parser.add_argument("--config", default="ftw.toml")

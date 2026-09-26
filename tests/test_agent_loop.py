@@ -192,6 +192,39 @@ class TestDispatchedToolCall:
         assert "exit 0" in tool_messages[0].content
 
 
+class TestEditFileTool:
+    """edit_file is registered exactly like run_command: a builtin
+    ToolSpec, dispatched to its own worker target, over the bus."""
+
+    async def test_allowed_call_is_dispatched_to_the_edit_worker(self, tmp_path):
+        result_reply = ResultEnvelope(
+            source="worker.tool.edit",
+            target="repl.master",
+            payload=ResultPayload(status="ok", summary="edited file.txt", outputs={"diff": "..."}),
+        )
+        dispatcher = RecordingDispatcher([result_reply])
+        loop = make_loop(
+            responses=[
+                assistant_tool_call("edit_file", {"path": "file.txt", "old_string": "a", "new_string": "b"}),
+                assistant_text("edited it"),
+            ],
+            dispatch=dispatcher,
+            interceptor=PreCommitInterceptor([]),  # ALLOW everything, no confirmation needed
+            output_root=tmp_path,
+        )
+
+        result = await loop.run_turn("fix file.txt")
+
+        assert result == "edited it"
+        assert len(dispatcher.calls) == 1
+        assert dispatcher.calls[0].payload.action == "edit_file"
+        assert dispatcher.calls[0].target == "worker.tool.edit"
+
+    async def test_edit_file_is_in_the_builtin_tool_specs(self, tmp_path):
+        loop = make_loop(responses=[assistant_text("hi")], output_root=tmp_path)
+        assert "edit_file" in {t.name for t in loop._tool_specs}
+
+
 class TestConfirmation:
     async def test_ask_decision_dispatches_only_when_confirmed(self, tmp_path):
         result_reply = ResultEnvelope(
@@ -1318,6 +1351,27 @@ class TestCallDeadlinesAreConsistent:
 
         assert captured[0].deadline_ms is not None
         assert captured[0].deadline_ms > 60_000  # the shell worker's own default command timeout
+
+    async def test_edit_file_gets_a_deadline(self, tmp_path):
+        captured = []
+
+        async def dispatch(call):
+            captured.append(call)
+            return ResultEnvelope(source="w", target="c", payload=ResultPayload(status="ok", summary="edited"))
+
+        loop = make_loop(
+            responses=[
+                assistant_tool_call("edit_file", {"path": "f", "old_string": "a", "new_string": "b"}),
+                assistant_text("done"),
+            ],
+            dispatch=dispatch,
+            interceptor=PreCommitInterceptor([]),
+            output_root=tmp_path,
+        )
+        await loop.run_turn("edit it")
+
+        assert captured[0].deadline_ms is not None
+        assert captured[0].deadline_ms >= 5_000
 
     async def test_delegate_skill_gets_a_generous_deadline(self, tmp_path):
         captured = []

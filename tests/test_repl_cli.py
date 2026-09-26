@@ -124,6 +124,43 @@ class TestBuildReplSessionWithRealWorker:
 
         assert reply == "it printed the line"
 
+    async def test_edit_file_round_trips_through_a_real_subprocess_worker(self, isolated_runtime_dir, tmp_path):
+        target = tmp_path / "greeting.txt"
+        target.write_text("hello world\n")
+        provider = MockModelProvider(
+            [
+                ProviderResponse(
+                    message=ChatMessage(
+                        role=ChatRole.ASSISTANT,
+                        content=None,
+                        tool_calls=[
+                            ToolCall(
+                                id="c1",
+                                name="edit_file",
+                                arguments={"path": str(target), "old_string": "hello", "new_string": "goodbye"},
+                            )
+                        ],
+                    )
+                ),
+                assistant_text("edited it"),
+            ]
+        )
+        out = io.StringIO()
+
+        handle = await build_repl_session(
+            ftw_home=tmp_path,
+            provider=provider,
+            input_fn=ScriptedInput(["y"]),  # confirms the one file edit
+            output=out,
+        )
+        try:
+            reply = await handle.session.agent_loop.run_turn("fix the greeting")
+        finally:
+            handle.close()
+
+        assert reply == "edited it"
+        assert target.read_text() == "goodbye world\n"
+
     async def test_default_events_address_matches_what_ftw_tap_dials_by_default(self, isolated_runtime_dir, tmp_path):
         """ftw tap's own default (--address, observability/tap.py) has to
         be the same address the REPL actually publishes on with no
@@ -561,6 +598,62 @@ class TestDelegatedSkillRealSubprocess:
 
         assert reply == "Build directory cleaned."
         assert "shell commands require confirmation" in out.getvalue()  # the relayed ASK was actually shown here
+
+    async def test_edit_file_works_inside_a_delegated_run_across_the_real_subprocess_boundary(self, isolated_runtime_dir, tmp_path):
+        """The delegated skill runner is a separate subprocess with its own
+        dispatch — edit_file needs its own routing wired there too, not
+        just in the interactive REPL's own AgentLoop."""
+        target = tmp_path / "notes.txt"
+        target.write_text("todo: fix the bug\n")
+        skills_dir = tmp_path / "skills"
+        write_skill(skills_dir, "notes/update", "notes.update", "Update the notes file.")
+
+        server = start_mock_model_server(
+            [
+                openai_tool_call_response(
+                    "edit_file", {"path": str(target), "old_string": "todo", "new_string": "done"}
+                ),
+                openai_tool_call_response("submit_result", {"status": "ok", "summary": "Updated the notes file."}),
+            ]
+        )
+        try:
+            config_path = tmp_path / "ftw.toml"
+            config_path.write_text(
+                f"""
+                [providers.mock_http]
+                kind = "openai_compatible"
+                base_url = "http://127.0.0.1:{server.server_port}/v1"
+
+                [tiers.fast]
+                provider = "mock_http"
+                model = "mock-model"
+                """
+            )
+
+            main_provider = MockModelProvider(
+                [
+                    tool_call_response("delegate_skill", {"name": "notes.update", "brief": "mark the bug fixed"}, "d1"),
+                    text_response("Notes updated."),
+                ]
+            )
+            out = io.StringIO()
+            handle = await build_repl_session(
+                ftw_home=tmp_path,
+                skills_dir=skills_dir,
+                config_path=config_path,
+                provider=main_provider,
+                input_fn=ScriptedInput(["y"]),  # answers the relayed ASK for the file edit
+                output=out,
+            )
+            try:
+                reply = await handle.session.agent_loop.run_turn("mark the bug fixed in notes")
+            finally:
+                handle.close()
+        finally:
+            server.shutdown()
+
+        assert reply == "Notes updated."
+        assert target.read_text() == "done: fix the bug\n"
 
 
 class TestCancelRealSubprocess:

@@ -1,10 +1,10 @@
 """Pre-Commit Interceptor Pipeline (ftw_plan.md §3.4).
 
 Runs between the model's action proposal and the framework firing the NNG
-CALL. Phase 1 ships one rule — every shell command requires human
-confirmation. Path sandboxing, blocklists, and step budgets replace that
-blanket rule in Phase 4; the pipeline shape doesn't change, only the rules
-in it.
+CALL. Phase 1 ships confirmation rules for side-effecting local actions —
+every shell command and every file edit requires human confirmation. Path
+sandboxing, blocklists, and step budgets replace those blanket rules in
+Phase 4; the pipeline shape doesn't change, only the rules in it.
 """
 
 from __future__ import annotations
@@ -40,6 +40,17 @@ class ConfirmShellCommands:
     def evaluate(self, call: CallEnvelope) -> InterceptOutcome:
         if call.payload.action == "run_command":
             return InterceptOutcome(InterceptDecision.ASK, reason="shell commands require confirmation")
+        return InterceptOutcome(InterceptDecision.ALLOW)
+
+
+class ConfirmFileEdits:
+    """Every ``edit_file`` call must be confirmed by a human before it's
+    allowed to fire — a file write is exactly as much a host side effect
+    as a shell command, so it gets the same blanket policy."""
+
+    def evaluate(self, call: CallEnvelope) -> InterceptOutcome:
+        if call.payload.action == "edit_file":
+            return InterceptOutcome(InterceptDecision.ASK, reason="file edits require confirmation")
         return InterceptOutcome(InterceptDecision.ALLOW)
 
 

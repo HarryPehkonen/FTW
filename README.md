@@ -50,7 +50,9 @@ The model can also find, mount, and unmount skills itself (`find_skill`,
 `mount_skill`, `unmount_skill`), and manages its own scratchpad
 (`pin`/`unpin`) and tool-output handles (`read_output`/`grep_output`) —
 all without your involvement unless you step in with the commands above.
-Shell commands the model proposes are confirmed with you before they run.
+Shell commands and file edits (`edit_file` — an exact-match string
+replacement, not a regex) the model proposes are both confirmed with you
+before they run.
 
 The prompt supports normal line editing and history (arrow keys, `Ctrl-R`
 search) on POSIX systems.
